@@ -1,0 +1,340 @@
+#!/usr/bin/env python3
+"""The weekly local restore check of solo01's database backups.
+
+Managed by MMX from roles/postgres_and_backups/files/run_local_restore_check
+in the systems repository. Run by solo_restore_check.service (a systemd timer
+on weekly_work_day), as root:
+
+    run_local_restore_check                       # the weekly check
+    run_local_restore_check --print-plan          # print the commands, run nothing
+    run_local_restore_check --settings FILE       # use another settings file
+
+What it proves: the newest backup in the Cloudflare R2 bucket can be
+downloaded, decrypted with the passphrase in pgbackrest.conf, started as a
+real Postgres, and holds the data each app expects. It does that by
+
+  1. restoring the newest backup, with pgBackRest, into a scratch directory
+     on this server's disk (as the account postgres, like a real restore),
+  2. starting a throwaway Postgres on it, as the account postgres, with the
+     same Postgres program that solo01 itself runs (Debian's
+     /usr/lib/postgresql/<major>/bin), listening only on a private Unix
+     socket inside the scratch directory: no network port, and no contact
+     with the live Postgres (10.20.1.1:5432 and /var/run/postgresql),
+  3. running each app's restore_drill_check_queries read-only; every query
+     must answer true,
+  4. stopping the throwaway Postgres and removing the scratch directory,
+     always, whether the check passed or failed.
+
+Nothing is downloaded: the check uses the Postgres that is already installed.
+The scratch directory needs about as much free disk as the database holds.
+The result is written to the result_file of the settings (by default
+/var/lib/solo-restore-check/last-result.json) as JSON, and MMWatchdog
+checks that it is fresh and says "passed". The program exits with 0 when the
+check passed and 1 when it failed, which also fails the timer's service.
+
+Only the Python standard library is used.
+"""
+
+import argparse
+import datetime
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+DEFAULT_SETTINGS_FILE = "/etc/solo/restore_check_settings.json"
+
+
+def restored_cluster_files(settings):
+    """The files a Debian cluster keeps outside its data directory and that the
+    throwaway Postgres needs inside it: pgBackRest backs up and restores the
+    data directory only. The throwaway Postgres has no network port and no
+    password, so a trusting pg_hba.conf is safe: only a process that can open
+    the private socket reaches it, and the socket's directory belongs to the
+    account postgres with mode 0700, so that is root and postgres.
+    shared_buffers is modest so the check fits beside the live Postgres and
+    the apps on a small server."""
+    return {
+        "postgresql.conf": (
+            "# Written by run_local_restore_check: the restored cluster's own file stays on solo01.\n"
+            "listen_addresses = ''\n"
+            "unix_socket_directories = '" + socket_directory(settings) + "'\n"
+            "archive_mode = off\n"
+            # Postgres refuses recovery when max_connections is lower than the
+            # live cluster's value (Debian's default is 100).
+            "max_connections = 100\n"
+            "shared_buffers = 64MB\n"
+        ),
+        "pg_hba.conf": "local all all trust\n",
+        "pg_ident.conf": "",
+    }
+
+
+class RestoreCheckFailed(Exception):
+    """A step of the check failed; the message says which and why."""
+
+
+def now_utc():
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def timestamp(moment):
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def run_command(arguments, timeout_seconds=None, extra_environment=None):
+    """Runs one command; returns (exit_code, stdout, stderr) and never raises for a failure."""
+    environment = dict(os.environ)
+    if extra_environment:
+        environment.update(extra_environment)
+    try:
+        finished = subprocess.run(
+            arguments,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            env=environment,
+            check=False,
+        )
+    except FileNotFoundError as error:
+        return 127, "", str(error)
+    except subprocess.TimeoutExpired:
+        return 124, "", "stopped after " + str(timeout_seconds) + " seconds"
+    return finished.returncode, finished.stdout, finished.stderr
+
+
+def load_settings(path):
+    with open(path, encoding="utf-8") as settings_file:
+        settings = json.load(settings_file)
+    for name in (
+        "postgresql_major_version",
+        "pgbackrest_config_file",
+        "stanza",
+        "scratch_directory",
+        "result_file",
+        "seconds_to_wait_for_postgres",
+        "seconds_to_wait_for_the_restore",
+        "apps",
+    ):
+        if name not in settings:
+            raise RestoreCheckFailed(path + " has no " + name + ". Run solo_server again so MMX writes it.")
+    return settings
+
+
+def socket_directory(settings):
+    return settings["scratch_directory"] + "/socket"
+
+
+def postgres_program_directory(settings):
+    return "/usr/lib/postgresql/" + str(settings["postgresql_major_version"]) + "/bin"
+
+
+def commands_of_the_check(settings):
+    """The commands the check runs, by name, in order. --print-plan prints them."""
+    scratch = settings["scratch_directory"]
+    data = scratch + "/data"
+    socket = socket_directory(settings)
+    logfile = scratch + "/postgres.log"
+    postgres_programs = postgres_program_directory(settings)
+    return {
+        "newest_backup": ["pgbackrest", "--config=" + settings["pgbackrest_config_file"], "--stanza=" + settings["stanza"], "info", "--output=json"],
+        "restore": [
+            "runuser", "-u", "postgres", "--",
+            "pgbackrest", "--config=" + settings["pgbackrest_config_file"], "--stanza=" + settings["stanza"],
+            "--pg1-path=" + data, "--type=immediate", "--target-action=promote", "--archive-mode=off", "restore",
+        ],
+        # The same three settings are in the scratch postgresql.conf. On the
+        # command line they also win over a postgresql.auto.conf that came
+        # with the backup: this Postgres must never listen on the network and
+        # never archive WAL into the live repository.
+        "start_postgres": [
+            "runuser", "-u", "postgres", "--",
+            postgres_programs + "/pg_ctl", "-D", data, "-l", logfile,
+            "-w", "-t", str(settings["seconds_to_wait_for_postgres"]),
+            "-o", "-c listen_addresses= -c unix_socket_directories=" + socket + " -c archive_mode=off",
+            "start",
+        ],
+        "stop_postgres": ["runuser", "-u", "postgres", "--", postgres_programs + "/pg_ctl", "-D", data, "-m", "immediate", "stop"],
+        "remove_the_scratch_directory": ["rm", "-rf", "--one-file-system", scratch],
+    }
+
+
+def clean_up(settings, run=run_command):
+    """Stops the throwaway Postgres and removes the scratch directory. Raises RestoreCheckFailed when the directory stays."""
+    commands = commands_of_the_check(settings)
+    # A postmaster.pid in the scratch data directory means that a throwaway
+    # Postgres may still run, such as after a killed check. Stop it first: a
+    # running Postgres holds the files. The command works only on the scratch
+    # data directory; the live /var/lib/postgresql is never touched. A stop
+    # that fails, such as for a stale file of a Postgres that is gone, is fine.
+    if os.path.exists(settings["scratch_directory"] + "/data/postmaster.pid"):
+        run(commands["stop_postgres"], 120)
+    shutil.rmtree(settings["scratch_directory"], ignore_errors=True)
+    if os.path.exists(settings["scratch_directory"]):
+        # Files that postgres owns: root removes them with rm.
+        run(commands["remove_the_scratch_directory"], 600)
+    if os.path.exists(settings["scratch_directory"]):
+        raise RestoreCheckFailed("could not remove the scratch directory " + settings["scratch_directory"] + ". Remove it by hand.")
+
+
+def newest_backup_label(settings, run):
+    code, output, error = run(commands_of_the_check(settings)["newest_backup"], 300)
+    if code != 0:
+        raise RestoreCheckFailed("pgbackrest info failed with exit " + str(code) + ": " + error.strip())
+    try:
+        stanzas = json.loads(output)
+        backups = [stanza for stanza in stanzas if stanza.get("name") == settings["stanza"]][0]["backup"]
+        return backups[-1]["label"]
+    except (ValueError, IndexError, KeyError):
+        raise RestoreCheckFailed("the stanza " + settings["stanza"] + " has no backup in the bucket yet, so there is nothing to restore")
+
+
+def restore_the_newest_backup(settings, run):
+    scratch = settings["scratch_directory"]
+    os.makedirs(scratch, mode=0o700, exist_ok=True)
+    socket = socket_directory(settings)
+    os.makedirs(socket, mode=0o700, exist_ok=True)
+    code, _, error = run(["chown", "postgres:postgres", scratch, socket], 60)
+    if code != 0:
+        raise RestoreCheckFailed("could not give the scratch directory to postgres: " + error.strip())
+    code, _, error = run(commands_of_the_check(settings)["restore"], settings["seconds_to_wait_for_the_restore"])
+    if code != 0:
+        raise RestoreCheckFailed("the restore from the bucket failed with exit " + str(code) + ": " + error.strip())
+    paths = []
+    for name, content in restored_cluster_files(settings).items():
+        path = scratch + "/data/" + name
+        with open(path, "w", encoding="utf-8") as cluster_file:
+            cluster_file.write(content)
+        os.chmod(path, 0o600)
+        paths.append(path)
+    # This program runs as root; postgres must own the files it reads.
+    code, _, error = run(["chown", "postgres:postgres"] + paths, 60)
+    if code != 0:
+        raise RestoreCheckFailed("could not give the cluster files to postgres: " + error.strip())
+
+
+def start_postgres(settings, run):
+    code, _, error = run(commands_of_the_check(settings)["start_postgres"], settings["seconds_to_wait_for_postgres"] + 60)
+    if code != 0:
+        raise RestoreCheckFailed("could not start the restored Postgres: " + (error.strip() or "pg_ctl exited with " + str(code)) + log_tail(settings))
+
+
+def log_tail(settings):
+    try:
+        with open(settings["scratch_directory"] + "/postgres.log", encoding="utf-8", errors="replace") as logfile:
+            tail = logfile.read()[-1500:].strip()
+    except OSError:
+        return ""
+    return " The end of the Postgres log: " + tail if tail else ""
+
+
+def psql_command(settings, database_name, sql):
+    # Every connection is read-only, so a query cannot change the restored copy.
+    return [
+        "runuser", "-u", "postgres", "--", "env", "PGOPTIONS=-c default_transaction_read_only=on",
+        postgres_program_directory(settings) + "/psql", "--no-psqlrc", "--host", socket_directory(settings),
+        "--username", "postgres", "--dbname", database_name,
+        "--tuples-only", "--no-align", "--set", "ON_ERROR_STOP=1", "--command", sql,
+    ]
+
+
+def wait_until_postgres_answers(settings, run, sleep, clock):
+    give_up_at = clock() + settings["seconds_to_wait_for_postgres"]
+    last_error = ""
+    while True:
+        code, output, error = run(psql_command(settings, "postgres", "select pg_is_in_recovery()"), 60)
+        if code == 0 and output.strip() == "f":
+            return
+        last_error = error.strip() or output.strip()
+        if clock() >= give_up_at:
+            raise RestoreCheckFailed("the restored Postgres did not finish starting within " + str(settings["seconds_to_wait_for_postgres"]) + " seconds: " + last_error)
+        sleep(5)
+
+
+def run_the_queries(settings, run):
+    results = []
+    for app_name, app in sorted(settings["apps"].items()):
+        for query in app["queries"]:
+            code, output, error = run(psql_command(settings, app["database_name"], query["sql"]), 300)
+            answer = output.strip() if code == 0 else error.strip()
+            results.append({"app": app_name, "query": query["name"], "passed": code == 0 and answer == "t", "answer": answer})
+    return results
+
+
+def write_the_result(settings, result):
+    path = settings["result_file"]
+    os.makedirs(os.path.dirname(path), mode=0o755, exist_ok=True)
+    temporary_path = path + ".new"
+    with open(temporary_path, "w", encoding="utf-8") as result_file:
+        json.dump(result, result_file, indent=2, sort_keys=True)
+        result_file.write("\n")
+    os.chmod(temporary_path, 0o644)
+    os.replace(temporary_path, path)
+
+
+def run_the_check(settings, run=run_command, sleep=time.sleep, clock=time.monotonic, wall_clock=now_utc):
+    """Runs the whole check and returns the result mapping that it also writes to result_file."""
+    started = wall_clock()
+    result = {
+        "result": "failed",
+        "started_at": timestamp(started),
+        "backup_label": "",
+        "checks": [],
+        "error": "",
+    }
+    try:
+        # A leftover from a check that was killed would block this one.
+        clean_up(settings, run)
+        result["backup_label"] = newest_backup_label(settings, run)
+        restore_the_newest_backup(settings, run)
+        start_postgres(settings, run)
+        wait_until_postgres_answers(settings, run, sleep, clock)
+        result["checks"] = run_the_queries(settings, run)
+        failed = [check for check in result["checks"] if not check["passed"]]
+        if not result["checks"]:
+            raise RestoreCheckFailed("no app has a restore_drill_check_queries entry, so the restore proved only that Postgres started")
+        if failed:
+            names = ", ".join(check["app"] + "/" + check["query"] for check in failed)
+            raise RestoreCheckFailed("these queries did not answer true on the restored copy: " + names)
+        result["result"] = "passed"
+    except RestoreCheckFailed as error:
+        result["error"] = str(error)
+    except OSError as error:
+        result["error"] = "the check could not use the disk: " + str(error)
+    finally:
+        # Always, whether the check passed or failed.
+        try:
+            clean_up(settings, run)
+        except RestoreCheckFailed as error:
+            result["result"] = "failed"
+            result["error"] = (result["error"] + " " + str(error)).strip()
+        finished = wall_clock()
+        result["finished_at"] = timestamp(finished)
+        result["seconds"] = int((finished - started).total_seconds())
+        write_the_result(settings, result)
+    return result
+
+
+def main(arguments=None):
+    parser = argparse.ArgumentParser(description="The weekly local restore check of solo01's database backups.")
+    parser.add_argument("--settings", default=DEFAULT_SETTINGS_FILE, help="the settings file, JSON (default: " + DEFAULT_SETTINGS_FILE + ")")
+    parser.add_argument("--print-plan", action="store_true", help="print the commands the check runs and run nothing")
+    given = parser.parse_args(arguments)
+    try:
+        settings = load_settings(given.settings)
+    except (OSError, ValueError, RestoreCheckFailed) as error:
+        print("run_local_restore_check: " + str(error), file=sys.stderr)
+        return 1
+    if given.print_plan:
+        print(json.dumps(commands_of_the_check(settings), indent=2))
+        return 0
+    result = run_the_check(settings, run=run_command, sleep=time.sleep)
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0 if result["result"] == "passed" else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

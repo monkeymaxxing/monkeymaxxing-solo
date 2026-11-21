@@ -1,0 +1,98 @@
+{{- /*
+  MMWatchdog's check groups for the apps, Caddy and the tunnel connector on
+  solo01. This file is an MMX template: MMX renders it on solo01 into
+  /etc/mmwatchdog/check_groups/apps_and_tunnel.yml. It reads the role inputs
+  apps and public_host_names, and the server's own facts.
+*/ -}}
+{{- /* The interface of the default route carries the users' requests. */ -}}
+{{- $public_interface := "" -}}
+{{- range .node.network.default_routes -}}{{- if and (eq .family "ipv4") (eq $public_interface "") -}}{{- $public_interface = .interface -}}{{- end -}}{{- end -}}
+# Managed by MMX from mmwatchdog_checks/apps_and_tunnel.yml in the systems repository.
+# To be woken for a check, set that check's alert_severity to sos.
+check_groups:
+  # Each reading covers the 5 minutes since the previous reading. MMWatchdog
+  # sends a warning after 15 minutes past a limit.
+  server_capacity:
+    check_every: 5m
+    time_limit_per_run: 10s
+    alert_after_failing_for: 15m
+    recovered_after_healthy_for: 5m
+    checks:
+      # Reason for 70%: leaves room for a burst and for a deploy. Reason for
+      # warn: slow, not down. Choose a bigger server.
+      cpu_is_below_70_percent:
+        node_resource: cpu
+        fail_when_measurement_above:
+          cpu_used_percent: 70
+        alert_severity: warn
+{{- if $public_interface }}
+      # 600 Mbit/s is 60% of a 1 Gbit/s port, the usual port of a rented
+      # server.
+      network_is_below_60_percent_of_the_port:
+        node_network_interface: {{ $public_interface }}
+        fail_when_measurement_above:
+          received_mbit_per_second: 600
+          sent_mbit_per_second: 600
+        alert_severity: warn
+{{- end }}
+
+  # Caddy and the tunnel connector bring each request in. They run as
+  # systemd units; the checks ask whether each answers.
+  #
+  # Reason for warn: the outside alarm's check of your public health URL
+  # wakes you when users cannot reach an app. These warn about the part that
+  # failed.
+  tunnel_connector_and_caddy:
+    check_every: 1m
+    time_limit_per_run: 10s
+    alert_after_failing_for: 2m
+    recovered_after_healthy_for: 1m
+    checks:
+      caddy_runs:
+        systemd_unit_state:
+          systemd_unit: caddy.service
+          fail_when: the_unit_is_not_active
+        alert_severity: warn
+      # cloudflared's readiness, at the metrics address in its unit
+      # (roles/apps_and_tunnel/main.yml): 200 while it holds at least one
+      # connection to Cloudflare.
+      cloudflared_is_connected_to_cloudflare:
+        http:
+          url: http://127.0.0.1:20241/ready
+        alert_severity: warn
+{{- range $app_name, $app := .inputs.apps }}
+{{- $public_host_name := index $.inputs.public_host_names $app_name }}
+{{- if not $public_host_name }}{{ fail (printf "public_host_names has no host name for %s" $app_name) }}{{ end }}
+      # The app's health URL through Caddy on solo01, asked the way
+      # cloudflared hands Caddy a user's request.
+      {{ $app_name }}_answers_through_caddy:
+        http:
+          url: http://127.0.0.1{{ $app.health_url_path }}
+          headers:
+            Host: {{ $public_host_name }}
+            X-Forwarded-Proto: https
+        alert_severity: warn
+{{- end }}
+{{- /* An app whose jobs_command is "" has no job container, so it has no job check. */ -}}
+{{- $some_app_has_jobs := false -}}
+{{- range $app_name, $app := .inputs.apps }}{{ if ne $app.jobs_command "" }}{{ $some_app_has_jobs = true }}{{ end }}{{ end -}}
+{{- if $some_app_has_jobs }}
+
+  # MMWatchdog records each job container's CPU readings without sending
+  # alerts, so a busy worker can be told from a busy web container.
+  job_containers:
+    check_every: 5m
+    time_limit_per_run: 10s
+    alert_after_failing_for: 15m
+    recovered_after_healthy_for: 5m
+    checks:
+{{- range $app_name, $app := .inputs.apps }}
+{{- if ne $app.jobs_command "" }}
+      {{ $app_name }}_jobs_cpu:
+        only_record_readings: true
+        systemd_unit_resource:
+          systemd_unit: {{ $app_name }}-jobs.service
+          resource: cpu
+{{- end }}
+{{- end }}
+{{- end }}

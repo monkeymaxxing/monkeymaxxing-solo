@@ -1,0 +1,240 @@
+# MMX's project settings for this one-server system. MMX finds the project
+# root by locating mmx_project_settings.yml. Values that every playbook or
+# role reads are under vars. A playbook passes each value a role needs as a
+# role input.
+#
+# A setting with no value after its colon, with a comment that says "the
+# setup fills it", is a value that only this system's setup can know: a
+# name, an address, a key or an ID. The template ships it empty, so a value
+# copied from the template never looks real. While it is empty, `mmx
+# validate` stops and names it, and playbooks/solo_server.yml refuses to run
+# (its stage refuse_values_the_setup_has_not_filled_in).
+project_name:                               # the setup fills it: such as acme_systems
+default_inventory: servers                  # inventories/servers.yml: solo01 alone
+vault_file: secrets_vault.age
+run_history_retention: 30d                  # mmx results and --diff work for a month of runs
+vars:
+  # Every server schedule is in UTC, one clock for every log. The coding
+  # agent picks these times during setup from the hours when most of your
+  # users are away, and tells you the times in your local time.
+  #
+  # nightly_work_starts_at: "01:00". The daily differential database backup
+  # starts at this UTC time. On weekly_work_day the full database backup
+  # starts at this time, the weekly local restore check follows two hours
+  # later, and the unused-image cleanup three hours later. "HH:MM", from
+  # 00:00 to 20:59, so the last job starts before midnight UTC.
+  nightly_work_starts_at: "01:00"
+  # weekly_work_day: sunday by default. The day of the full database backup,
+  # the weekly local restore check, and the unused-image cleanup. Reason for
+  # Sunday: most apps have their fewest users then, and the restore check's
+  # result is ready at the start of the week. A full backup every week is
+  # fixed: the restore check needs a recent full backup.
+  weekly_work_day: sunday
+  # The weekly window for planned reboots (playbooks/reboot_after_updates.yml).
+  # No server reboots by itself. starts_at is UTC. length_minutes: 60 by
+  # default, from 30 to 1440. Reason for at least 30: a reboot and the
+  # server's checks after it take several minutes. Reason for at most 1440:
+  # a window longer than a day is no longer a quiet time you chose.
+  maintenance_window:
+    weekday: tuesday
+    starts_at: "21:00"
+    length_minutes: 60
+  # The longest reboot_after_updates waits for solo01 to come back before the
+  # run fails, in whole minutes, from 1m to 45m. 3m by default: three reboots
+  # of a cloud server took 34, 54 and 56 seconds until the server answered.
+  come_back_wait_after_a_reboot: 3m
+  # production_releases_wait_for_a_persons_approval: true. With true, the
+  # coding agent shows you the tested version and waits for your yes before
+  # each release to production. With false, it releases a tested version
+  # without asking and reports the result. The coding agent follows this
+  # setting; no server reads it. Reason for true: a release changes what
+  # customers see, so you decide when it goes live.
+  production_releases_wait_for_a_persons_approval: true
+  # The first release, when your site goes live at the end of the setup, asks
+  # for no approval while this is false: you already approved the app's
+  # changes at the start of the setup. Setting it to true asks once more.
+  first_release_waits_for_a_persons_approval: false
+  # false until the go-live step has proven that the public site answers.
+  # While false, the Cloudflare Worker outside alarm checks in only to say
+  # that solo01 is alive and runs no edge health check of your public host
+  # names, so an app that was never live does not alert. The coding agent
+  # sets it to true at go-live.
+  public_site_checks_run: false
+  cloudflare_account_id:                     # the setup fills it: the 32-character Cloudflare account ID
+
+  # The apps solo01 runs. Each app follows the same contract as the
+  # Monkeymaxxing Stack, so moving to the Stack needs no app change: a
+  # Containerfile, Postgres, Cloudflare R2 for uploaded files, a health URL,
+  # the PORT and WEB_CONCURRENCY settings, and separate migrate, web and jobs
+  # commands. Add one block per app; each app gets its own Postgres database
+  # and role, its own containers, and its own Cloudflare route.
+  apps:
+    shop:
+      image: ghcr.io/example-owner/shop       # the image without a tag; deployed_image_tags in inventories/servers.yml names the tag
+      database_name: shop
+      # Two web ports, used in turn: a deploy starts the new release on the
+      # port that is not in use, checks it, switches Caddy, then stops the old
+      # release. Both ports are above 1024 and differ.
+      web_port_a: 8001
+      web_port_b: 8002
+      # The path, on the app's own web port, that answers HTTP 200 while the
+      # app is healthy. Caddy, the deploy and MMWatchdog ask it, and the
+      # Cloudflare Worker asks it through your public host name.
+      health_url_path: /health
+      # The directory inside the image that holds the app's fingerprinted
+      # asset files (CSS, JavaScript). A deploy copies the old and the new
+      # release's files into one directory that both web containers mount, so
+      # a page the old release rendered still finds its files after the
+      # switch. Write "" for an app with no such files.
+      asset_directory: /rails/public/assets
+      migration_command: bin/rails db:migrate
+      # The command that starts the app's background-job worker. Write "" for
+      # an app with no background jobs: it then gets no job container.
+      jobs_command: bin/jobs
+      production_uploads_r2_bucket: example-shop-uploads    # "" for an app that keeps no uploaded files
+      # The app's plain settings, written to /etc/<app>/<app>_settings.env.
+      # Secrets come from the vault (secrets_from_vault below). Leave
+      # R2_BUCKET out: the template writes it from production_uploads_r2_bucket.
+      env:
+        RAILS_ENV: production
+        APP_ORIGIN: https://shop.example.com
+      # Each environment variable the app reads from the vault. The vault key
+      # is <app>_<VARIABLE>, such as shop_SECRET_KEY_BASE.
+      secrets_from_vault:
+        SECRET_KEY_BASE:
+          where_the_value_comes_from: generated_by_the_setup
+        R2_ACCESS_KEY_ID:
+          where_the_value_comes_from: generated_by_the_setup
+        R2_SECRET_ACCESS_KEY:
+          where_the_value_comes_from: generated_by_the_setup
+      # The weekly local restore check restores the newest backup into a
+      # throwaway Postgres and runs each query read-only against the app's
+      # database. Every query must answer true. A restore with no data fails.
+      restore_drill_check_queries:
+        - name: the_migrations_came_back
+          sql: select count(*) > 0 from schema_migrations
+
+  # The registry login the server pulls the apps' images with. The
+  # registry account's token is in the vault as container_registry_read_only_token.
+  container_registry_read_only_username:     # the setup fills it: the registry account's login
+
+  # One OpenSSH public key line for each person who may log in as root, with a
+  # comment that says whose key it is. The setup writes your laptop's key
+  # here. root_ssh_public_keys must not be empty: without a key nobody could
+  # reach solo01. Removing a key removes its access at the next run.
+  root_ssh_public_keys: []
+
+  # The pinned release of each program the server downloads or your laptop
+  # installs. A SHA-256 of zeros marks a copy of a checkout that is not a
+  # release: playbooks/solo_server.yml refuses it before it changes anything.
+  # These are the releases the Monkeymaxxing Stack v0.3.0 was tested with.
+  solo_software:
+    mmx:
+      version: "0.2.0"
+      download_url: https://github.com/monkeymaxxing/mmx/releases/download/v0.2.0/mmx-0.2.0-linux-amd64.tar.gz
+      sha256: "d97379ab2ee818be0e744006fe0cefd989c62517a4c6b31385bd01cdae036c28"
+    # doubleshell runs only on your laptop, where the coding agent installs it
+    # at the start of the setup. download_url and sha256 are its linux-amd64
+    # archive. laptop_archive_sha256 gives each laptop platform's archive,
+    # doubleshell-VERSION-PLATFORM.tar.gz beside download_url.
+    doubleshell:
+      version: "0.1.2"
+      download_url: https://github.com/monkeymaxxing/doubleshell/releases/download/v0.1.2/doubleshell-0.1.2-linux-amd64.tar.gz
+      sha256: "46af98d02664e85160f162ad14692300ed97977a0d377c56f6adf32957d37e51"
+      laptop_archive_sha256:
+        linux-amd64: "46af98d02664e85160f162ad14692300ed97977a0d377c56f6adf32957d37e51"
+        linux-arm64: "49d53a301ff6bef2841f8d0d23d848120762fe067af63ca34a360ee30917f4aa"
+        macos-amd64: "4569d405dfc8e4edfcd6b3457728b76717a6f64ab6f7e0c560d561513df522f7"
+        macos-arm64: "f6aa2793ac27f4d05523a8dfe07f65be7b0fda387a08385947ea99e90b601110"
+    mmwatchdog:
+      version: "0.1.3"
+      download_url: https://github.com/monkeymaxxing/mmwatchdog/releases/download/v0.1.3/mmwatchdog-0.1.3-linux-amd64.tar.gz
+      sha256: "20f71ca17974e96fb7a04ba68ca82a1862b02df45cae7ed4fee5fe515b33c948"
+
+  # Plain Postgres from Debian 13, one cluster named main. Debian 13 ships
+  # Postgres 17, supported with security fixes until November 2029. A major
+  # upgrade comes only with a new Debian release.
+  postgresql_major_version: 17
+
+  # Where pgBackRest sends every database change and each backup: one bucket
+  # in your Cloudflare R2, through R2's S3-compatible API.
+  #
+  # r2_s3_endpoint is https://ACCOUNT_ID.r2.cloudflarestorage.com, written
+  # without the "https://", such as 0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com.
+  # R2 buckets use path-style addresses and the region "auto".
+  #
+  # The bucket carries an R2 Bucket Lock rule that keeps each object for
+  # lock_backups_against_deletion_for_days. The key on solo01 can write
+  # objects but cannot change Bucket Lock rules, so a compromised server
+  # cannot delete its own backups. Trade-off: the Cloudflare account owner
+  # can still remove a lock rule, unlike a compliance-mode lock at a
+  # separate company. pgBackRest encrypts every file with aes-256-cbc before
+  # it leaves the server; the passphrase is in the vault as
+  # pgbackrest_repository_cipher_passphrase.
+  #
+  # How long backups are kept. Each setting has a minimum, and the template
+  # refuses a value below it:
+  # keep_database_backups_for_days: 21. At least 14. A full backup runs every
+  #   week and the weekly restore check needs the previous full backup.
+  #   pgBackRest keeps full backups for this many days.
+  # lock_backups_against_deletion_for_days: 14. From 8 up to
+  #   keep_database_backups_for_days, because pgBackRest must never try to
+  #   delete a backup that is still locked.
+  backups:
+    r2_s3_endpoint:                          # the setup fills it: ACCOUNT_ID.r2.cloudflarestorage.com
+    bucket_name:                             # the setup fills it: the R2 bucket for database backups
+    keep_database_backups_for_days: 21
+    lock_backups_against_deletion_for_days: 14
+
+  # The Cloudflare Worker outside alarm, in your own Cloudflare account.
+  # worker_url is the Worker's address, such as
+  # https://solo-outside-alarm.example-account.workers.dev (without a path).
+  # delay_seconds: how long solo01's check-ins may stop before the Worker
+  # sends the held alert, from 180 up. 300 by default: solo01 checks in every
+  # minute and a reboot leaves at most about 2.5 minutes without a check-in.
+  # health_check_failures_before_alert: how many probes of an app's public
+  # health URL in a row, five minutes apart, must fail before the Worker
+  # alerts, from 1 to 10. 2 skips the short blip of a restart or a deploy.
+  outside_alarm:
+    worker_url:                              # the setup fills it: https://NAME.SUBDOMAIN.workers.dev
+    delay_seconds: 300
+    health_check_failures_before_alert: 2
+
+  # Where alerts go, from both MMWatchdog on solo01 and the outside alarm.
+  # kind is one of pushover, slack, discord, telegram, webhook, email. Each
+  # kind reads these vault keys:
+  #   pushover: pushover_application_token, pushover_user_or_group_key
+  #   slack:    slack_webhook_url
+  #   discord:  discord_webhook_url
+  #   telegram: telegram_bot_token, and the chat in telegram_chat_id below
+  #   webhook:  alert_webhook_bearer_token, when webhook_has_a_bearer_token
+  #             is true; the address is webhook_url below
+  #   email:    email_login_password, when email_login_user is not ""
+  # Email: MMWatchdog on solo01 sends the email. The outside alarm sends only
+  # HTTPS requests, so with kind email it records that solo01 is alive and
+  # holds no message. To be told when solo01 itself is unreachable, choose
+  # pushover, slack, discord, telegram or webhook.
+  # enabled: false until the alerts step of the setup has put the keys in the
+  # vault; the same change sets it to true. While false, no alert pretends
+  # to reach a person: MMWatchdog has no destination and the outside alarm
+  # holds no message. Reason: the site can go live before you have a phone
+  # alert account.
+  alert_destination:
+    enabled: false
+    kind: pushover
+    # Pushover only. pushover_priority: 1 is "high"; 2 is "emergency", which
+    # repeats until you acknowledge it. pushover_sound names a Pushover sound.
+    pushover_sound: cosmic
+    pushover_priority: 1
+    # Telegram only: the chat that gets alerts, in quotes, such as "-1001234567890".
+    telegram_chat_id: ""
+    # Webhook only: the address that takes each alert as JSON, and whether it
+    # takes a bearer token (vault key alert_webhook_bearer_token).
+    webhook_url: ""
+    webhook_has_a_bearer_token: false
+    # Email only.
+    email_smtp_server: ""                    # such as smtp.example.com:587
+    email_connection_security: starttls      # starttls, implicit_tls, or unencrypted
+    email_from: ""
+    email_to: []
+    email_login_user: ""

@@ -1,0 +1,119 @@
+{{- /*
+  MMWatchdog's check groups for Postgres and its backups on solo01. This
+  file is an MMX template: MMX renders it on solo01 into
+  /etc/mmwatchdog/check_groups/postgres_and_backups.yml. It reads the
+  role input weekly_work_day only through the comment below.
+*/ -}}
+# Managed by MMX from mmwatchdog_checks/postgres_and_backups.yml in the systems repository.
+# To be woken for a check, set that check's alert_severity to sos. The
+# checks a careful team raises first: the backups, write-ahead log
+# archiving, and the weekly local restore check.
+check_groups:
+  # The checks log in as the operating system account postgres, through the
+  # server's local socket.
+  postgres:
+    check_every: 1m
+    time_limit_per_run: 10s
+    alert_after_failing_for: 2m
+    recovered_after_healthy_for: 1m
+    checks:
+      # Reason for warn, not sos: your public health URL, which the outside
+      # alarm asks from Cloudflare, wakes you when users are hurt. A person
+      # whose app cannot work without Postgres may raise this to sos.
+      postgres_answers:
+        postgresql: {}
+        alert_severity: warn
+      # Postgres numbers transactions. Near 100 percent, Postgres refuses
+      # every write until a long vacuum finishes, while reads keep working.
+      # A healthy server reads about 5 to 10, and Postgres's own emergency
+      # vacuum starts near 9. 50 leaves about a billion transactions: weeks
+      # on a busy server, time to find what blocks vacuum.
+      # Reason for warn: there is time to act before writes stop.
+      transaction_ids_are_less_than_half_way_to_wraparound:
+        postgresql: {}
+        fail_when_measurement_above:
+          transaction_ids_used_before_wraparound_percent: 50
+        alert_severity: warn
+        no_alerts_or_recovery_actions_while_these_checks_fail: [postgres/postgres_answers]
+      # Reason for 70%: leaves room for a burst and for the apps' own
+      # connection pools. Reason for warn: new connections fail only near 100%.
+      connections_are_below_70_percent:
+        postgresql: {}
+        fail_when_measurement_above:
+          connections_used_percent: 70
+        alert_severity: warn
+        alert_after_failing_for: 15m
+        no_alerts_or_recovery_actions_while_these_checks_fail: [postgres/postgres_answers]
+
+  # What to do: rerun the backup. archive_timeout is 60 seconds, so a segment
+  # of the write-ahead log should reach the bucket within a minute or two.
+  write_ahead_log_archiving:
+    check_every: 1m
+    time_limit_per_run: 10s
+    alert_after_failing_for: 0s
+    recovered_after_healthy_for: 1m
+    checks:
+      # Reason for 300 seconds: archive_timeout is 60 seconds, so 5 minutes
+      # means archiving is stuck. Reason for warn: nothing is lost yet, but
+      # every minute past the limit is a minute a restore cannot reach.
+      # A careful team raises this check to sos.
+      archived_within_5_minutes:
+        postgresql: {}
+        fail_when_measurement_above:
+          wal_archive_lag_seconds: 300
+        alert_severity: warn
+        no_alerts_or_recovery_actions_while_these_checks_fail: [postgres/postgres_answers]
+
+  # What to do: rerun the backup. pgBackRest takes a daily backup, and the
+  # check also fails on any problem pgBackRest reports.
+  backups:
+    check_every: 10m
+    time_limit_per_run: 1m
+    alert_after_failing_for: 0s
+    recovered_after_healthy_for: 0s
+    checks:
+      # Reason for 26 hours: a daily backup plus 2 hours for a slow one.
+      # Reason for warn: the earlier backups still restore. A careful team
+      # raises this check to sos.
+      latest_backup_is_less_than_26_hours_old:
+        pgbackrest:
+          stanza: main
+        fail_when_measurement_above:
+          latest_backup_age_hours: 26
+        alert_severity: warn
+
+  # The weekly local restore check (/usr/local/sbin/run_local_restore_check)
+  # restores the newest backup into a throwaway Postgres and runs each
+  # app's restore_drill_check_queries. It writes
+  # /var/lib/solo-restore-check/last-result.json. The check below fails
+  # when the file is missing, older than 8 days (one week plus a day of
+  # slack), or does not say "result": "passed".
+  # Reason for warn: the latest backup may still restore, but nobody has
+  # proven it this week. A careful team raises this check to sos.
+  weekly_local_restore_check:
+    check_every: 1h
+    time_limit_per_run: 30s
+    alert_after_failing_for: 0s
+    recovered_after_healthy_for: 0s
+    checks:
+      restore_check_passed_in_8_days:
+        shell:
+          script: |
+            file=/var/lib/solo-restore-check/last-result.json
+            if [ ! -f "$file" ]; then
+              echo "no weekly local restore check result yet: $file does not exist"
+              exit 1
+            fi
+            if [ -z "$(find "$file" -mmin -11520)" ]; then
+              echo "the last weekly local restore check result is older than 8 days"
+              exit 1
+            fi
+            python3 -I - "$file" <<'PYTHON'
+            import json, sys
+            result = json.load(open(sys.argv[1]))
+            if result.get("result") != "passed":
+                print("the last weekly local restore check failed: " + str(result.get("error", "")))
+                sys.exit(1)
+            print("the last weekly local restore check passed, backup " + str(result.get("backup_label", "")))
+            PYTHON
+        alert_severity: warn

@@ -1,0 +1,30 @@
+{{- /*
+  The settings of send_outside_alarm_check_in.py,
+  /etc/solo/outside_alarm_check_in_settings.json. It holds no secret: the
+  secrets are in files that only root reads. It reads the role inputs
+  outside_alarm, alert_destination, apps, public_host_names and
+  public_site_checks_run.
+*/ -}}
+{{- $apps := dict -}}
+{{- range $app_name, $app := .inputs.apps -}}
+{{- $_ := set $apps $app_name (dict "host_name" (index $.inputs.public_host_names $app_name) "health_url_path" $app.health_url_path) -}}
+{{- end -}}
+{{- $destination := .inputs.alert_destination -}}
+{{- $settings := dict
+  "server_name" .node.name
+  "worker_url" .inputs.outside_alarm.worker_url
+  "outside_alarm_delay_seconds" .inputs.outside_alarm.delay_seconds
+  "health_check_failures_before_alert" .inputs.outside_alarm.health_check_failures_before_alert
+  "public_site_checks_run" .inputs.public_site_checks_run
+  "secrets_directory" "/etc/mmwatchdog/secrets"
+  "check_in_token_file" "/etc/solo/secrets/outside-alarm-check-in-token"
+  "alert_destination" (dict
+    "enabled" $destination.enabled
+    "kind" $destination.kind
+    "pushover_sound" $destination.pushover_sound
+    "pushover_priority" $destination.pushover_priority
+    "telegram_chat_id" $destination.telegram_chat_id
+    "webhook_url" (get $destination "webhook_url" | default "")
+    "webhook_has_a_bearer_token" $destination.webhook_has_a_bearer_token)
+  "apps" $apps -}}
+{{ toPrettyJson $settings }}

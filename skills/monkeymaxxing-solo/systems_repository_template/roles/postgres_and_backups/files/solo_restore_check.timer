@@ -1,0 +1,19 @@
+{{- /*
+  The weekly local restore check's timer. It runs on weekly_work_day, 2 hours
+  after nightly_work_starts_at, in UTC (Sunday 03:00 in the template): the
+  full backup starts at nightly_work_starts_at and the check needs it. The
+  day and time come in as the role inputs weekly_work_day and
+  nightly_work_starts_at; playbooks/solo_server.yml checks them before any
+  change.
+*/ -}}
+# Managed by MMX from roles/postgres_and_backups/files/solo_restore_check.timer in the systems repository.
+[Unit]
+Description=Weekly local restore check of the database backups
+
+[Timer]
+OnCalendar={{ .inputs.weekly_work_day }} {{ $p := splitList ":" .inputs.nightly_work_starts_at }}{{ $t := add (add (mul (atoi (index $p 0)) 60) (atoi (index $p 1))) 120 }}{{ printf "%02d:%02d" (div $t 60) (mod $t 60) }}:00 UTC
+# A check whose time passed while solo01 was off runs when it next starts.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,362 @@
+# The checklist of this system: every setup and verification item of
+# Monkeymaxxing Solo, in the order the system is built. The coding agent
+# works down the list during the setup and records the result of each check.
+# When the setup ends, every item is done, or deviated with its reason.
+#
+# state: open      not proven yet; waits_for says what must happen first
+# state: done      the verification passed; the item gets verified_at (UTC),
+#                  and last_result with what the check measured
+# state: deviated  the system differs from the item's requirement;
+#                  deviation says what differs and why
+#
+# An item with `part: later_when_it_happens` waits for an event after the
+# setup: the first rollback, the first weekly restore check, or a secret
+# rotation. A later item that stays open is no gap in the setup.
+#
+# An item becomes done only after its verification passed. When verified_at
+# is older than verify_again_every, the item counts as open again.
+
+solo_version: "0.1.0"
+# solo_commit records the commit of the Monkeymaxxing Solo repository from
+# which the coding agent copied the system's files. The coding agent records
+# the commit during the initial setup and with each new version. A copy can
+# come from a commit between two tagged versions, so solo_version alone
+# cannot identify the copied files.
+solo_commit: ""
+
+# What each app provides so it runs on solo01 and, later, on the Monkeymaxxing
+# Stack with no change. The coding agent checks the app's code before the
+# server exists. Each app gets a copy of these items under apps; put the
+# app's name at the start of each item's id and in its text.
+apps:
+  shop:
+    items:
+      - id: shop_stores_data_only_in_postgres_and_object_storage
+        title: shop stores its data only in Postgres and object storage
+        state: open
+        part: setup
+        protects_against: uploads and sessions that vanish at the next deploy or when solo01 is replaced
+        verification: >-
+          shop saves uploads to an R2 bucket, whose name is shop's
+          production_uploads_r2_bucket in mmx_project_settings.yml ("" when
+          shop keeps no uploads), and keeps sessions in cookies or Postgres. No
+          setting of shop stores mutable app data in a local directory, a
+          SQLite file, or a Podman volume. solo01 runs shop's containers with
+          a read-only file system, so a file shop writes to its own disk fails
+          at once with "read-only file system".
+      - id: shop_runs_from_one_containerfile
+        title: shop builds into one container image from a Containerfile
+        state: open
+        part: setup
+        protects_against: a release that cannot be rebuilt or rolled back
+        verification: >-
+          The app's repository has a Containerfile, and the image it builds is
+          pushed to the registry under the app's full 40-character Git commit
+          as its tag. deployed_image_tags in inventories/servers.yml names that tag.
+      - id: shop_listens_on_port_and_answers_its_health_url
+        title: shop listens on the PORT setting and answers HTTP 200 at its health URL
+        state: open
+        part: setup
+        protects_against: a deploy that switches to a release that is not ready
+        verification: >-
+          A container of the image, started with PORT=8002, answers HTTP 200 at
+          health_url_path while the app and its database work, and a non-200
+          answer when the database is unreachable. The health URL needs no login.
+      - id: shop_sizes_its_workers_from_web_concurrency
+        title: shop reads WEB_CONCURRENCY for the number of web worker processes
+        state: open
+        part: setup
+        protects_against: a bigger server that runs the same number of workers
+        verification: >-
+          shop's web server reads WEB_CONCURRENCY (Puma, Gunicorn and Uvicorn do
+          by themselves; a Node app forks that many workers), or shop sets
+          WEB_CONCURRENCY in its own env in mmx_project_settings.yml.
+      - id: shop_migrates_with_one_command_that_keeps_the_running_release_working
+        title: shop's migration command keeps the running release working
+        state: open
+        part: setup
+        protects_against: a deploy that breaks live requests during the switch
+        verification: >-
+          migration_command runs the migrations in a one-off container of the new
+          image. Each migration adds before it removes (expand, then contract),
+          so the release that still runs keeps working until Caddy switches.
+          Each statement waits at most 5 seconds for a table lock.
+      - id: shop_background_jobs_run_from_one_command
+        title: shop's background jobs run from jobs_command, or shop has none
+        state: open
+        part: setup
+        protects_against: a job worker that no one starts, or two that run the same job
+        verification: >-
+          jobs_command starts the worker, which reads its jobs from Postgres
+          and finishes the current job within 30 seconds of the stop signal. For an
+          app with no background jobs, jobs_command is "" and this item is
+          deviated with "no background jobs" as the reason.
+      - id: shop_reads_its_database_from_database_url
+        title: shop connects to Postgres through the DATABASE_URL setting
+        state: open
+        part: setup
+        protects_against: an app that cannot find its database
+        verification: >-
+          The app reads DATABASE_URL, a postgresql:// URL, from its environment
+          at start. The same URL form works on the Monkeymaxxing Stack.
+
+# The system, in the order it is built.
+items:
+  - id: solo01_is_a_debian_13_server_with_a_public_address
+    title: solo01 is a Debian 13 server at a provider, with a public IPv4 address
+    state: open
+    part: setup
+    protects_against: a server that cannot run the pinned software
+    verification: >-
+      `cat /etc/os-release` on solo01 names Debian 13, and public_ipv4_address
+      in inventories/servers.yml is the address the provider lists.
+  - id: mmx_and_doubleshell_are_installed_on_the_laptop
+    title: The laptop has the pinned MMX and doubleshell releases
+    state: open
+    part: setup
+    protects_against: a laptop that runs a different release than the one this version was tested with
+    verification: >-
+      `mmx version` and `doubleshell version` print the versions in solo_software
+      in mmx_project_settings.yml, and each program's archive matched the SHA-256
+      there.
+  - id: the_systems_repository_is_private_and_holds_the_template
+    title: The systems repository is private and holds this template
+    state: open
+    part: setup
+    protects_against: server settings and a vault in a repository other people can read
+    verification: >-
+      The repository's host lists it as private. `mmx validate solo_server`
+      prints "Valid" with every value the setup fills filled in.
+  - id: the_vault_exists_and_the_passphrase_is_kept_safe
+    title: secrets_vault.age exists and its passphrase is in a password manager
+    state: open
+    part: setup
+    protects_against: secrets in the coding agent's conversation, or a vault no one can open
+    verification: >-
+      `mmx secrets list-keys` lists the keys the first run needs. Each secret was
+      typed at a hidden prompt on the laptop, so no secret appeared in the
+      conversation. The person confirms the passphrase is saved.
+  - id: ssh_reaches_solo01_only_through_wireguard
+    title: SSH works through doubleshell and the provider's SSH port is closed
+    state: open
+    part: setup
+    protects_against: bots that try to log in, and attacks on a public SSH port
+    verification: >-
+      `ssh solo01 true` works through doubleshell. From outside the WireGuard
+      network, a connection to solo01's public address on TCP port 22 gets no
+      answer. `sshd -T` on solo01 lists only listenaddress 10.20.1.1 and
+      permitrootlogin without-password.
+  - id: the_firewall_admits_only_wireguard
+    title: The firewall admits only UDP 443 and UDP 51820 from the internet
+    state: open
+    part: setup
+    protects_against: a service that listens on a public address by mistake
+    verification: >-
+      `ufw status verbose` on solo01 shows the default "deny (incoming)" and
+      only UDP 443, UDP 51820, and TCP 22 on wg0 from the laptop's address. An
+      nmap scan of solo01's public address finds no open TCP port.
+  - id: security_updates_install_daily_and_no_server_reboots_by_itself
+    title: Security updates install every day, and solo01 never reboots by itself
+    state: open
+    part: setup
+    protects_against: known flaws that stay open, and a surprise reboot
+    verification: >-
+      `unattended-upgrade --dry-run` on solo01 succeeds, /etc/apt/apt.conf.d/52unattended-upgrades-local
+      says Automatic-Reboot "false", and MMWatchdog's security_updates checks pass.
+  - id: postgres_17_listens_only_on_the_wireguard_address
+    title: Postgres 17 runs the cluster main and listens only on 10.20.1.1
+    state: open
+    part: setup
+    protects_against: a database that any network can reach
+    verification: >-
+      `ss -ltn` on solo01 shows Postgres only on 10.20.1.1:5432, and
+      `pg_lsclusters` shows 17 main online. shared_buffers is 128MB.
+  - id: each_app_has_its_own_database_and_login
+    title: Each app has its own Postgres database and login role
+    state: open
+    part: setup
+    protects_against: one app that reads or breaks another app's data
+    verification: >-
+      `\l` in psql lists one database for each app in apps, each owned by a
+      role of the same name, and pg_hba.conf has one line for each app that
+      allows only that role to log in to that database from 10.20.1.1.
+  - id: backups_reach_the_r2_bucket_encrypted
+    title: pgBackRest sends every change and each backup to the R2 bucket, encrypted
+    state: open
+    part: setup
+    protects_against: losing the database with the server
+    verification: >-
+      `sudo -u postgres pgbackrest --stanza=main info` shows a full backup, and
+      its repo1-cipher-type is aes-256-cbc. `pgbackrest check` passes, so
+      archive-push reaches the bucket. MMWatchdog's backups and
+      write_ahead_log_archiving checks pass.
+    verify_again_every: 7d
+  - id: the_bucket_lock_stops_deleting_backups
+    title: The R2 bucket's lock rules keep each backup for 14 days, and solo01's key cannot remove them
+    state: open
+    part: setup
+    protects_against: a compromised solo01 that deletes or overwrites its own backups
+    verification: >-
+      The bucket has Bucket Lock rules of lock_backups_against_deletion_for_days
+      days covering pgbackrest/archive/main/1 and pgbackrest/backup/main/2
+      (leaving pgBackRest's mutable index files archive.info and backup.info
+      writable). With solo01's own R2 key, both deleting and overwriting a
+      fresh backup object under pgbackrest/backup/main/ fail with HTTP 409 or
+      403, and changing the lock rules fails. Trade-off the person accepts:
+      the Cloudflare account owner can still remove the lock rules.
+  - id: the_weekly_local_restore_check_passes
+    title: The weekly local restore check restores the newest backup and passes
+    state: open
+    part: setup
+    protects_against: a backup that cannot be restored, or a lost encryption passphrase
+    verification: >-
+      /var/lib/solo-restore-check/last-result.json says "result": "passed"
+      with every app's restore_drill_check_queries answered true. The check
+      stopped its throwaway Postgres and removed its scratch directory.
+    verify_again_every: 8d
+  - id: a_restore_to_a_point_in_time_works
+    title: restore_database brings the database back, to the newest data or to a chosen time
+    state: open
+    part: later_when_it_happens
+    waits_for: the first time the database must be restored, or a rehearsal the person chooses
+    protects_against: a restore that fails when it is needed
+    verification: >-
+      `mmx run restore_database --var confirm_this_replaces_the_current_database=true`
+      restored the database, each app's check queries answered true, and the
+      apps started again. The replaced data directory is kept until the person
+      deletes it.
+  - id: apps_run_in_containers_with_a_confined_profile
+    title: Each app runs in Podman containers with no capabilities and the AppArmor profile
+    state: open
+    part: setup
+    protects_against: a compromised app that reaches the server
+    verification: >-
+      `podman inspect` of each web and job container shows a read-only root file
+      system, no capabilities, no-new-privileges and the profile solo-app-containers.
+      `aa-status` lists solo-app-containers.
+  - id: the_site_is_reachable_only_through_the_cloudflare_tunnel
+    title: Each app's public host name reaches solo01 only through the Cloudflare Tunnel
+    state: open
+    part: setup
+    protects_against: a web port that is open to the internet
+    verification: >-
+      `curl https://<host>/<health_url_path>` answers 200 through Cloudflare, and
+      solo01's public address answers nothing on TCP ports 80 and 443.
+      `systemctl is-active caddy cloudflared` on solo01 prints active twice.
+  - id: a_deploy_switches_without_dropping_requests
+    title: A deploy starts the new release beside the old one and switches without dropping requests
+    state: open
+    part: setup
+    protects_against: downtime at each release
+    verification: >-
+      `mmx run deploy` after a new tag started the new web container on the free
+      port, its health URL answered 200, Caddy switched, and the old container
+      stopped. A request loop against the public host name had no failed request.
+  - id: a_rollback_returns_to_the_previous_release
+    title: Committing the previous tag and running deploy returns to the previous release
+    state: open
+    part: later_when_it_happens
+    waits_for: the first rollback, or a rehearsal the person chooses
+    protects_against: a bad release that stays live
+    verification: >-
+      deployed_image_tags names the previous tag, `mmx run deploy` ran, and
+      the public health URL answered 200 from the previous image.
+  - id: mmwatchdog_runs_and_its_alert_reaches_a_person
+    title: MMWatchdog runs on solo01 and its test alert reaches the person
+    state: open
+    part: setup
+    protects_against: failures that no one hears about
+    verification: >-
+      `mmwatchdog config --json` on solo01 shows the check groups every_server,
+      postgres_and_backups and apps_and_tunnel and the destination
+      alerts_to_you. `mmwatchdog send-notice` arrives on the person's phone or
+      channel. alert_destination.enabled is true.
+  - id: the_outside_alarm_fires_when_solo01_goes_silent
+    title: The Cloudflare Worker outside alarm sends the held alert when solo01 stops checking in
+    state: open
+    part: setup
+    protects_against: a frozen, out-of-memory or offline solo01 that cannot alert about itself
+    verification: >-
+      `send_outside_alarm_check_in.py --send-test` on solo01 delivers the test
+      alert to the person. After `systemctl stop solo_outside_alarm_check_in.timer`
+      for outside_alarm.delay_seconds, the held alert arrives; after the timer
+      starts again, the recovery message arrives.
+  - id: the_outside_alarm_checks_each_apps_public_health_url
+    title: The Worker asks each app's public health URL from Cloudflare and alerts after consecutive failures
+    state: open
+    part: setup
+    protects_against: an app that is down for users while solo01 is up
+    verification: >-
+      public_site_checks_run is true in mmx_project_settings.yml and the next
+      check-in lists a health check for each app. After the app's health URL fails
+      for health_check_failures_before_alert probes in a row (five minutes
+      apart), the alert arrives, and a recovery message arrives when it answers again.
+  - id: secrets_never_appeared_in_the_conversation
+    title: No secret was pasted into the coding agent's conversation
+    state: open
+    part: setup
+    protects_against: secrets stored in chat history
+    verification: >-
+      Every secret was typed at a hidden prompt of the setup helper or of
+      `mmx secrets set`. The vault holds every key that `mmx secrets usage` lists
+      for solo_server, and no secret value is in the repository's history.
+  - id: solo01_can_be_rebuilt_from_git_and_r2
+    title: A lost solo01 can be rebuilt from the repository and the R2 backups
+    state: open
+    part: setup
+    protects_against: a server that cannot be replaced
+    verification: >-
+      The repository holds every server setting. The vault passphrase, the
+      repository's backup copy and the R2 key are known to the person. The
+      steps are written in operating_procedures/rebuild_solo01_on_a_new_server.md:
+      a new Debian 13 server, first-boot WireGuard, `mmx run restore_database`,
+      then `mmx run solo_server`.
+  - id: planned_reboots_run_inside_the_maintenance_window
+    title: reboot_after_updates reboots solo01 inside the weekly window and waits until it works
+    state: open
+    part: later_when_it_happens
+    waits_for: the first time installed updates ask for a reboot
+    protects_against: a kernel update that never takes effect, and a reboot that leaves the apps down
+    verification: >-
+      `mmx run reboot_after_updates` rebooted solo01 inside the window, then
+      Postgres, Caddy, the tunnel connector, each app and MMWatchdog worked
+      again, and /var/run/reboot-required is gone.
+    verify_again_every: 8d
+  - id: a_secret_rotation_reaches_the_server
+    title: A rotated secret reaches the server and the old value stops working
+    state: open
+    part: later_when_it_happens
+    waits_for: the first secret rotation
+    protects_against: a leaked secret that stays valid
+    verification: >-
+      The new value replaced the old one in the vault (`mmx secrets set KEY
+      --replace`), `mmx run solo_server` changed only the files that hold it, and
+      the old value is refused by the service that issued it.
+
+# What Solo leaves out. Informational: none of these is an open item, and
+# none is a gap in the setup. Each one is a reason to move to the Monkeymaxxing
+# Stack, which keeps the same app contract, so no app changes.
+what_solo_leaves_out:
+  title: "What Solo leaves out (when to upgrade to the Monkeymaxxing Stack)"
+  items:
+    - id: more_than_one_server
+      leaves_out: Several app, database, jobs or load-balancer servers.
+      upgrade_when: one 2 vCPU / 4 GB server no longer carries the load, or the site must survive the loss of a server without a rebuild.
+    - id: automatic_database_failover
+      leaves_out: pg_auto_failover and database replicas; solo01 runs plain Postgres 17.
+      upgrade_when: a rebuild from R2 backups takes longer than the site may be down.
+    - id: staging_server
+      leaves_out: A staging01 server that runs each release before production.
+      upgrade_when: a release needs a full rehearsal before it reaches users.
+    - id: separate_systems_desk
+      leaves_out: A systems desk with two-factor login; your keys and the vault passphrase live on your laptop.
+      upgrade_when: more than one person manages the servers, or a lost laptop would be too costly.
+    - id: separate_backup_company
+      leaves_out: A third storage account for backups (Backblaze B2 with a compliance lock) and the nightly copy of uploaded files.
+      upgrade_when: the Cloudflare account owner must not be able to remove the backup lock, or uploaded files need their own offsite backup.
+    - id: on_call_alerting_and_the_triage_agent
+      leaves_out: MMHotline on-call schedules, the AI triage agent, team access controls and the emergency lock-out button.
+      upgrade_when: several people share on-call, or alerts need escalation and a record.
+    - id: provider_server_scripts
+      leaves_out: Scripts that create servers at a provider; you create solo01 by hand at any provider.
+      upgrade_when: servers are added or replaced often enough that creating them by hand costs more than the scripts.

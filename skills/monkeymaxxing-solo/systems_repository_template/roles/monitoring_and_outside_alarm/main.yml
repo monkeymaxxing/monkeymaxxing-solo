@@ -1,0 +1,302 @@
+# Monitoring on solo01, from inside and from outside.
+#
+# From inside, MMWatchdog runs standalone: no fleet hub, and its own alert
+# destination. The base_server role has unpacked the release named by
+# mmwatchdog_release. This role writes MMWatchdog's settings and check groups
+# into a candidate directory, validates the candidate with the unpacked
+# release's mmwatchdog, and only after validation installs the checked files,
+# selects the release, and restarts MMWatchdog inside a short maintenance
+# window, so the restart sends no false alert.
+#
+# From outside, solo01 checks in with the Cloudflare Worker outside alarm
+# every minute (send_outside_alarm_check_in.py). When the check-ins stop, the
+# Worker, which runs in your own Cloudflare account, sends the held alert; it
+# also asks each app's public health URL from Cloudflare's network.
+#
+# The alert destination's secret files (pushover-application-token and the
+# other files named in files/alert_destinations.yml) are written by their own
+# stages of playbooks/solo_server.yml before this role runs, one stage per
+# kind, so a run needs the vault keys of the chosen kind only.
+inputs:
+  mmwatchdog_release:                       # version, download_url, and sha256
+    type: mapping
+    required: true
+  apps:
+    type: mapping
+    required: true
+  public_host_names:
+    type: mapping
+    required: true
+  alert_destination:                        # vars.alert_destination from mmx_project_settings.yml
+    type: mapping
+    required: true
+  outside_alarm:                            # vars.outside_alarm from mmx_project_settings.yml
+    type: mapping
+    required: true
+  public_site_checks_run:                   # vars.public_site_checks_run
+    type: boolean
+    required: true
+  outside_alarm_check_in_token:             # the Worker's check-in token
+    type: string
+    required: true
+    secret: true
+
+node_tasks:
+  - task_block:
+      id: mmwatchdog_runs_standalone
+      changes:
+        # The running MMWatchdog does not use the candidate configuration.
+        # Validation reads the candidate configuration before installation.
+        - id: create_the_candidate_configuration_directory
+          directory:
+            path: /usr/local/lib/mmwatchdog/candidate_config
+            owner: root
+            group: root
+            permissions_mode: "0700"
+        - id: create_the_candidate_check_groups_directory
+          directory:
+            path: /usr/local/lib/mmwatchdog/candidate_config/check_groups
+            owner: root
+            group: root
+            permissions_mode: "0700"
+        - id: write_the_candidate_node_settings
+          file:
+            path: /usr/local/lib/mmwatchdog/candidate_config/mmwatchdog_node_settings.yml
+            source: files/mmwatchdog_node_settings.yml
+            owner: root
+            group: root
+            permissions_mode: "0644"
+        - id: write_the_candidate_alert_destinations
+          file:
+            path: /usr/local/lib/mmwatchdog/candidate_config/alert_destinations.yml
+            template: files/alert_destinations.yml
+            owner: root
+            group: root
+            permissions_mode: "0644"
+        - id: write_the_candidate_check_groups_of_the_server
+          file:
+            path: /usr/local/lib/mmwatchdog/candidate_config/check_groups/every_server.yml
+            template: ../../mmwatchdog_checks/every_server.yml
+            owner: root
+            group: root
+            permissions_mode: "0644"
+        - id: write_the_candidate_check_groups_of_postgres_and_backups
+          file:
+            path: /usr/local/lib/mmwatchdog/candidate_config/check_groups/postgres_and_backups.yml
+            template: ../../mmwatchdog_checks/postgres_and_backups.yml
+            owner: root
+            group: root
+            permissions_mode: "0644"
+        - id: write_the_candidate_check_groups_of_the_apps_and_the_tunnel
+          file:
+            path: /usr/local/lib/mmwatchdog/candidate_config/check_groups/apps_and_tunnel.yml
+            template: ../../mmwatchdog_checks/apps_and_tunnel.yml
+            owner: root
+            group: root
+            permissions_mode: "0644"
+        # A rejected candidate fails the block at
+        # check_the_candidate_with_the_new_release, so the running MMWatchdog
+        # keeps its release and configuration. Validation only reads, so MMX
+        # also runs validation during a dryrun.
+        - id: check_the_candidate_with_the_new_release
+          shell:
+            script: bash -c "$PROGRAM"
+            dryrun: bash -c "$PROGRAM"
+            env:
+              PROGRAM: |
+                release="/usr/local/lib/mmwatchdog/releases/$MMWATCHDOG_VERSION"
+                "$release/mmwatchdog" validate \
+                  --config-dir /usr/local/lib/mmwatchdog/candidate_config \
+                  --official-extra-module-dir "$release/official_extra_modules" \
+                  --external-module-dir /usr/local/lib/mmwatchdog/external_modules
+              MMWATCHDOG_VERSION: "{{ .inputs.mmwatchdog_release.version }}"
+            changed_when: false
+
+        # Install the checked files and select the unpacked release. The
+        # restart follows in activate.
+        - id: install_the_node_settings
+          file:
+            path: /etc/mmwatchdog/mmwatchdog_node_settings.yml
+            content_from_node_paths: [/usr/local/lib/mmwatchdog/candidate_config/mmwatchdog_node_settings.yml]
+            owner: root
+            group: root
+            permissions_mode: "0644"
+        - id: install_the_alert_destinations
+          file:
+            path: /etc/mmwatchdog/alert_destinations.yml
+            content_from_node_paths: [/usr/local/lib/mmwatchdog/candidate_config/alert_destinations.yml]
+            owner: root
+            group: root
+            permissions_mode: "0644"
+        # The check groups directory holds exactly the three files below.
+        - id: delete_every_other_check_group
+          directory:
+            path: /etc/mmwatchdog/check_groups
+            owner: root
+            group: root
+            permissions_mode: "0755"
+            delete_everything_inside_except: [every_server.yml, postgres_and_backups.yml, apps_and_tunnel.yml]
+        - id: install_the_check_groups_of_the_server
+          file:
+            path: /etc/mmwatchdog/check_groups/every_server.yml
+            content_from_node_paths: [/usr/local/lib/mmwatchdog/candidate_config/check_groups/every_server.yml]
+            owner: root
+            group: root
+            permissions_mode: "0644"
+        - id: install_the_check_groups_of_postgres_and_backups
+          file:
+            path: /etc/mmwatchdog/check_groups/postgres_and_backups.yml
+            content_from_node_paths: [/usr/local/lib/mmwatchdog/candidate_config/check_groups/postgres_and_backups.yml]
+            owner: root
+            group: root
+            permissions_mode: "0644"
+        - id: install_the_check_groups_of_the_apps_and_the_tunnel
+          file:
+            path: /etc/mmwatchdog/check_groups/apps_and_tunnel.yml
+            content_from_node_paths: [/usr/local/lib/mmwatchdog/candidate_config/check_groups/apps_and_tunnel.yml]
+            owner: root
+            group: root
+            permissions_mode: "0644"
+        - id: use_the_release_official_extra_modules
+          symlink:
+            path: /usr/local/lib/mmwatchdog/official_extra_modules
+            target: "/usr/local/lib/mmwatchdog/releases/{{ .inputs.mmwatchdog_release.version }}/official_extra_modules"
+        - id: use_the_release_program
+          symlink:
+            path: /usr/local/bin/mmwatchdog
+            target: "/usr/local/lib/mmwatchdog/releases/{{ .inputs.mmwatchdog_release.version }}/mmwatchdog"
+        - id: install_the_release_systemd_unit
+          file:
+            path: /etc/systemd/system/mmwatchdog.service
+            content_from_node_paths: ["/usr/local/lib/mmwatchdog/releases/{{ .inputs.mmwatchdog_release.version }}/mmwatchdog.service"]
+            owner: root
+            group: root
+            permissions_mode: "0644"
+      activate:
+        # Maintenance prevents the alerts caused by the restart from being
+        # sent. On a first install, no MMWatchdog runs to send restart alerts,
+        # so start_maintenance returns success without opening a window.
+        # --for 3m: the restart, which systemd ends after its start timeout
+        # (90s by default), the 10s wait for the inspection socket, and a
+        # margin. A run that fails or dies after the restart leaves the
+        # alerts paused at most that long.
+        - id: start_maintenance
+          shell:
+            script: |
+              mmwatchdog_state=0
+              systemctl is-active --quiet mmwatchdog || mmwatchdog_state=$?
+              case $mmwatchdog_state in
+                0) ;;
+                3|4) exit 0 ;;
+                *) exit 1 ;;
+              esac
+              /usr/local/bin/mmwatchdog maintenance on --every-check-group --for 3m --reason "mmwatchdog deploy" --without-maintenance-on-and-off-alerts
+              exit 2
+            only_when_tracked_inputs_changed: true
+            success_exit_codes: [0, 2]
+            changed_when: {equals: ["{{ .this_node_task.exit_code }}", 2]}
+        - id: restart_mmwatchdog
+          systemd_service:
+            name: mmwatchdog
+            state: running
+            start_at_boot: true
+            refresh: restart
+      verify:
+        - id: wait_for_the_inspection_socket
+          wait_for:
+            path_exists: /run/mmwatchdog/mmwatchdog.sock
+            wait_at_most: 10s
+        - id: check_that_mmwatchdog_answers
+          shell:
+            script: /usr/local/bin/mmwatchdog config --json
+            dryrun: /usr/local/bin/mmwatchdog config --json
+            changed_when: false
+        - id: end_maintenance
+          when: {equals: ["{{ .node_tasks.start_maintenance.change }}", changed]}
+          shell:
+            script: /usr/local/bin/mmwatchdog maintenance off --every-check-group
+
+  # Delete earlier MMWatchdog releases from the server only after the new
+  # MMWatchdog release runs.
+  - id: remove_earlier_mmwatchdog_releases
+    directory:
+      path: /usr/local/lib/mmwatchdog/releases
+      delete_everything_inside_except: ["{{ .inputs.mmwatchdog_release.version }}"]
+
+  # The outside alarm's check-in. The check-in token is the Worker's secret
+  # SOLO_OUTSIDE_ALARM_TOKEN: the Worker refuses a check-in without it.
+  - id: create_the_settings_directory_of_solo
+    directory:
+      path: /etc/solo
+      owner: root
+      group: root
+      permissions_mode: "0755"
+  - id: create_the_secrets_directory_of_solo
+    directory:
+      path: /etc/solo/secrets
+      owner: root
+      group: root
+      permissions_mode: "0700"
+  - id: write_the_check_in_token
+    file:
+      path: /etc/solo/secrets/outside-alarm-check-in-token
+      content: "{{ .inputs.outside_alarm_check_in_token }}\n"
+      owner: root
+      group: root
+      permissions_mode: "0600"
+  - id: write_the_settings_of_the_check_in
+    file:
+      path: /etc/solo/outside_alarm_check_in_settings.json
+      template: files/outside_alarm_check_in_settings.json
+      owner: root
+      group: root
+      permissions_mode: "0644"
+  - id: install_the_program_that_sends_the_check_in
+    file:
+      path: /usr/local/sbin/send_outside_alarm_check_in.py
+      source: files/send_outside_alarm_check_in.py
+      owner: root
+      group: root
+      permissions_mode: "0755"
+  # The check-in runs at boot, so a reboot leaves at most about 2.5 minutes
+  # without one, and then every minute. Reason for a service of its own and
+  # not systemd_scheduled_job: the timer also needs OnBootSec.
+  - task_block:
+      id: outside_alarm_check_in_timer
+      changes:
+        - id: install_the_check_in_service
+          systemd_unit:
+            name: solo_outside_alarm_check_in.service
+            content: |
+              # Managed by MMX from roles/monitoring_and_outside_alarm/main.yml in the systems repository.
+              [Unit]
+              Description=Check in with the Cloudflare Worker outside alarm
+              After=network-online.target
+              Wants=network-online.target
+
+              [Service]
+              Type=oneshot
+              ExecStart=/usr/local/sbin/send_outside_alarm_check_in.py
+              # A Worker that does not answer must not pile up check-ins.
+              TimeoutStartSec=60
+        - id: install_the_check_in_timer
+          systemd_unit:
+            name: solo_outside_alarm_check_in.timer
+            content: |
+              # Managed by MMX from roles/monitoring_and_outside_alarm/main.yml in the systems repository.
+              [Unit]
+              Description=Check in with the Cloudflare Worker outside alarm every minute
+
+              [Timer]
+              OnBootSec=15s
+              OnCalendar=*-*-* *:*:00
+              AccuracySec=1s
+
+              [Install]
+              WantedBy=timers.target
+      activate:
+        - id: run_the_check_in_timer
+          systemd_service:
+            name: solo_outside_alarm_check_in.timer
+            state: running
+            start_at_boot: true

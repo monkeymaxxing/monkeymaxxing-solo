@@ -1,0 +1,20 @@
+{{- /*
+  cloudflared's settings: which public host name goes where. The tunnel is
+  locally managed, so this file, not Cloudflare's dashboard, holds the
+  routes, and a rebuilt server gets them from the repository. It reads the
+  role inputs apps and public_host_names.
+*/ -}}
+# Managed by MMX from roles/apps_and_tunnel/files/cloudflared_config.yml
+# in the systems repository. The tunnel token comes from /etc/cloudflared/tunnel_token.env.
+#
+# cloudflared forwards requests for each app's public host name to Caddy on
+# this server, which picks the app's live web container. Every other host
+# name gets 404.
+ingress:
+{{- range $app_name, $app := .inputs.apps }}
+{{- $public_host_name := index $.inputs.public_host_names $app_name }}
+{{- if not $public_host_name }}{{ fail (printf "public_host_names has no host name for %s" $app_name) }}{{ end }}
+  - hostname: {{ $public_host_name }}
+    service: http://127.0.0.1:80
+{{- end }}
+  - service: http_status:404

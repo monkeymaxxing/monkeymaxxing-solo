@@ -1,0 +1,203 @@
+# Deploys the image tags that deployed_image_tags in inventories/servers.yml
+# names, with no downtime: start the new release beside the old one, then
+# switch (Kamal's pattern). The coding agent runs deploy after it commits a
+# new tag, from your laptop:
+#
+#   mmx dryrun deploy     # shows every change; changes nothing
+#   mmx run deploy
+#
+# A rollback is a commit of the previous tag, which runs the same steps. The
+# previous image remains on solo01 until the weekly cleanup removes unused
+# images made more than 7 days ago
+# (files_used_by_several_roles/podman_image_cleanup.service).
+#
+# The steps, on solo01:
+#   1. Find each app's live web container, and the free port for the app's new
+#      web container. Check that solo01 has memory for one more copy of its
+#      live web containers. Without enough memory the deploy stops before
+#      image pulls, migrations, or changes to running containers.
+#   2. Pull the new images. Nothing changes for users.
+#   3. Run each app's migrations, once, in a one-off container of the new
+#      image, with a 5 second lock timeout, so a migration that would hold up
+#      live requests stops the deploy before the switch.
+#   4. Start the new web containers beside the old ones, on the free ports,
+#      with the previous release's asset files too, so pages rendered before
+#      the switch can still load their asset files. Wait until every new web
+#      container's health URL returns HTTP 200. A new web container that
+#      fails is removed, users stay on the old web containers, and the run
+#      fails with the reason.
+#   5. Record the new web containers as the live ones, then switch Caddy to
+#      them. A reload drops no connection.
+#   6. Stop the old web containers, each with 30 seconds to finish its
+#      requests; then the job containers change to the new release.
+#   7. Check each app through its public host name, the way users reach it.
+command_line_vars:
+  # Step 1's memory check stops a deploy on a server that lacks memory for the
+  # running release and the release being deployed. The rollback of a release
+  # that uses more memory than it should, as a release that leaks memory
+  # does, can then go ahead without the memory check. Review the memory
+  # check's available and needed memory numbers first, and run the rollback
+  # without the check only with a person's approval:
+  #
+  #   mmx run deploy --var skip_the_memory_check=true
+  skip_the_memory_check:
+    type: boolean
+    default: false
+
+fleet_stages:
+  # 1. Every later step uses the live and new web container records in
+  # live_web_containers and new_web_containers.
+  - id: find_the_live_and_new_web_ports
+    nodes: solo_server
+    node_tasks:
+      - id: install_the_program_that_finds_the_live_web_ports
+        file:
+          path: /usr/local/sbin/find_live_web_ports
+          source: roles/apps_and_tunnel/files/find_live_web_ports
+          owner: root
+          group: root
+          permissions_mode: "0755"
+      - id: find_the_live_and_new_web_ports
+        shell:
+          script: /usr/local/sbin/find_live_web_ports
+          dryrun: /usr/local/sbin/find_live_web_ports
+          env:
+            APPS: "{{ .vars.apps }}"
+            DEPLOYED_IMAGE_TAGS: "{{ .vars.deployed_image_tags }}"
+          changed_when: false
+    outputs:
+      live_web_containers: "{{ .node_tasks.find_the_live_and_new_web_ports.stdout_json.live_web_containers }}"
+      new_web_containers: "{{ .node_tasks.find_the_live_and_new_web_ports.stdout_json.new_web_containers }}"
+
+  # 1, continued. For the minute of the switch, solo01 runs the running
+  # release's and the new release's web containers together. Before image
+  # pulls, migrations, or changes to running containers, solo01 must have
+  # memory available for another copy of the live web containers at current
+  # use, plus a tenth of its memory for growth during the deploy, including
+  # container warm-up, jobs, Postgres, and the programs' file cache. A server
+  # without enough stops the run here, and the failure says what memory it
+  # lacks. `mmx results` shows the numbers of each run.
+  - id: check_that_solo01_has_memory_for_the_new_release
+    nodes: solo_server
+    when: {not: "{{ .vars.skip_the_memory_check }}"}
+    on_node_failure: stop_run
+    node_tasks:
+      - id: install_the_program_that_checks_memory_for_the_new_release
+        file:
+          path: /usr/local/sbin/check_memory_for_the_new_release
+          source: roles/apps_and_tunnel/files/check_memory_for_the_new_release
+          owner: root
+          group: root
+          permissions_mode: "0755"
+      - id: check_memory_for_the_new_release
+        shell:
+          script: /usr/local/sbin/check_memory_for_the_new_release
+          dryrun: /usr/local/sbin/check_memory_for_the_new_release
+          env:
+            LIVE_WEB_CONTAINERS: "{{ .outputs.find_the_live_and_new_web_ports[.node.name].live_web_containers }}"
+          changed_when: false
+    outputs:
+      memory_available_mib: "{{ .node_tasks.check_memory_for_the_new_release.stdout_json.memory_available_mib }}"
+      memory_needed_mib: "{{ .node_tasks.check_memory_for_the_new_release.stdout_json.memory_needed_mib }}"
+
+  # 2. A server that can't pull stops the deploy before migrations or changes
+  # to running containers.
+  - id: pull_the_new_images
+    nodes: solo_server
+    on_node_failure: stop_run
+    node_tasks:
+      - id: pull_the_new_image_of_each_app
+        loop: "{{ .vars.apps }}"
+        as: app
+        podman_image:
+          image: "{{ .outputs.find_the_live_and_new_web_ports[.node.name].new_web_containers[.app.key].image }}"
+          pull_image: when_missing
+          registry_username: "{{ .vars.container_registry_read_only_username }}"
+          registry_password: "{{ .secrets.container_registry_read_only_token }}"
+
+  # 3. A one-off container of the new image runs each app's migration
+  # command. The migrations keep the running release working (expand, then
+  # contract). Each statement waits at most 5 seconds for a table lock and
+  # fails if the lock remains unavailable
+  # (roles/apps_and_tunnel/files/run_app_migrations).
+  - id: run_the_migrations
+    nodes: solo_server
+    on_node_failure: stop_run
+    node_tasks:
+      - id: run_the_migrations_of_each_app
+        loop: "{{ .vars.apps }}"
+        as: app
+        shell:
+          # set -f: the command's words are split, never expanded as file names.
+          script: set -f; /usr/local/sbin/run_app_migrations "$APP_NAME" "$IMAGE" $MIGRATION_COMMAND
+          env:
+            APP_NAME: "{{ .app.key }}"
+            IMAGE: "{{ .outputs.find_the_live_and_new_web_ports[.node.name].new_web_containers[.app.key].image }}"
+            MIGRATION_COMMAND: "{{ .app.value.migration_command }}"
+
+  # 4. The apps_and_tunnel role starts each app's new web container on the
+  # free port and waits for its health URL; one that fails is removed again.
+  # Caddy still sends every request to the old web containers.
+  - id: start_the_new_release_beside_the_old
+    nodes: solo_server
+    on_node_failure: stop_run
+    node_tasks:
+      - role: apps_and_tunnel
+        inputs:
+          set_up_the_server: false
+          release_step: start_the_new_release_beside_the_old
+          private_ip: "{{ .vars.private_ip }}"
+          apps: "{{ .vars.apps }}"
+          public_host_names: "{{ .vars.public_host_names }}"
+          live_web_containers: "{{ .outputs.find_the_live_and_new_web_ports[.node.name].live_web_containers }}"
+          new_web_containers: "{{ .outputs.find_the_live_and_new_web_ports[.node.name].new_web_containers }}"
+          container_registry_username: "{{ .vars.container_registry_read_only_username }}"
+          container_registry_password: "{{ .secrets.container_registry_read_only_token }}"
+
+  # 5. Only when every new web container is healthy: the role records the new
+  # port as the live one, which the next run's find_the_live_and_new_web_ports
+  # reads, then rewrites Caddy's list and reloads Caddy.
+  - id: send_requests_to_the_new_release
+    nodes: solo_server
+    on_node_failure: stop_run
+    node_tasks:
+      - role: apps_and_tunnel
+        inputs:
+          set_up_the_server: false
+          release_step: send_requests_to_the_new_release
+          private_ip: "{{ .vars.private_ip }}"
+          apps: "{{ .vars.apps }}"
+          public_host_names: "{{ .vars.public_host_names }}"
+          live_web_containers: "{{ .outputs.find_the_live_and_new_web_ports[.node.name].live_web_containers }}"
+          new_web_containers: "{{ .outputs.find_the_live_and_new_web_ports[.node.name].new_web_containers }}"
+          container_registry_username: "{{ .vars.container_registry_read_only_username }}"
+          container_registry_password: "{{ .secrets.container_registry_read_only_token }}"
+
+  # 6. The old web containers stop, and each app's job container restarts on
+  # the new release.
+  - id: stop_the_old_release
+    nodes: solo_server
+    node_tasks:
+      - role: apps_and_tunnel
+        inputs:
+          set_up_the_server: false
+          release_step: stop_the_old_release
+          private_ip: "{{ .vars.private_ip }}"
+          apps: "{{ .vars.apps }}"
+          public_host_names: "{{ .vars.public_host_names }}"
+          live_web_containers: "{{ .outputs.find_the_live_and_new_web_ports[.node.name].live_web_containers }}"
+          new_web_containers: "{{ .outputs.find_the_live_and_new_web_ports[.node.name].new_web_containers }}"
+          container_registry_username: "{{ .vars.container_registry_read_only_username }}"
+          container_registry_password: "{{ .secrets.container_registry_read_only_token }}"
+
+  # 7. Through DNS, Cloudflare, the tunnel, and Caddy, as a user's request goes.
+  - id: check_each_app_through_its_public_host_name
+    nodes: solo_server
+    node_tasks:
+      - id: wait_until_each_app_answers_through_its_public_host_name
+        loop: "{{ .vars.apps }}"
+        as: app
+        wait_for:
+          url_responds: "https://{{ .vars.public_host_names[.app.key] }}{{ .app.value.health_url_path }}"
+          expected_http_status_codes: [200]
+          wait_at_most: 60s

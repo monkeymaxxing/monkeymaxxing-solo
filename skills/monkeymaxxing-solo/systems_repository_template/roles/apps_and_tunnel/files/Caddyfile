@@ -1,0 +1,51 @@
+{{- /*
+  Caddy on solo01: cloudflared brings each request in from Cloudflare, and
+  Caddy sends it to the app's live web container on 127.0.0.1. It reads the
+  role inputs apps, public_host_names, live_web_containers,
+  new_web_containers, and requests_go_to_the_new_release, which only the
+  deploy's switch sets: then Caddy lists the new web containers.
+*/ -}}
+{{- $web_containers := ternary .inputs.new_web_containers .inputs.live_web_containers .vars.requests_go_to_the_new_release -}}
+# Managed by MMX from roles/apps_and_tunnel/files/Caddyfile in the systems repository.
+{
+	# The admin API listens on a socket that only root and Caddy can open,
+	# not on a loopback port: the apps' containers share this server's
+	# network. A reload (caddy reload, which systemctl reload runs) finds the
+	# socket in this file.
+	admin unix//var/lib/caddy/admin.socket
+	# Cloudflare holds the certificates; the tunnel carries plain HTTP to Caddy.
+	auto_https off
+	# Only cloudflared on this server reaches Caddy.
+	default_bind 127.0.0.1
+	servers {
+		# Keep the X-Forwarded-For and X-Forwarded-Proto headers that
+		# cloudflared passes on from Cloudflare, so an app sees the user's
+		# address and that the request came in over HTTPS.
+		trusted_proxies static 127.0.0.1/32
+	}
+}
+{{- range $app_name, $app := .inputs.apps }}
+{{- $public_host_name := index $.inputs.public_host_names $app_name }}
+{{- if not $public_host_name }}{{ fail (printf "public_host_names has no host name for %s" $app_name) }}{{ end }}
+
+# {{ $app_name }}: the web container that serves it.
+http://{{ $public_host_name }} {
+	reverse_proxy {
+		to 127.0.0.1:{{ (index $web_containers $app_name).web_port }}
+		# A container that refuses a connection, such as one restarting, is
+		# skipped for 2 seconds, and the request tries again. While none
+		# answers, a request waits up to 15 seconds for one.
+		fail_duration 2s
+		lb_try_duration 15s
+		# The container's health URL, every 5 seconds, asked the way a
+		# user's request arrives.
+		health_uri {{ $app.health_url_path }}
+		health_interval 5s
+		health_timeout 3s
+		health_headers {
+			Host {{ $public_host_name }}
+			X-Forwarded-Proto https
+		}
+	}
+}
+{{- end }}

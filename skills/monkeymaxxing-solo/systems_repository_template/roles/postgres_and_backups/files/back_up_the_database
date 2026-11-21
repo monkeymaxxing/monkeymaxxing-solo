@@ -1,0 +1,23 @@
+#!/bin/bash
+# Managed by MMX from roles/postgres_and_backups/files/back_up_the_database
+# in the systems repository. Takes one pgBackRest backup of the stanza main,
+# as the account postgres:
+#
+#   back_up_the_database full   # every weekly_work_day, from pgbackrest_full_backup.timer
+#   back_up_the_database diff   # every other day, from pgbackrest_differential_backup.timer
+#
+# A failed backup exits with pgBackRest's code, which fails the timer's
+# service, and MMWatchdog alerts.
+set -euo pipefail
+
+backup_type=${1:-}
+case $backup_type in
+  full | diff) ;;
+  *)
+    echo "usage: back_up_the_database full|diff" >&2
+    exit 2
+    ;;
+esac
+
+exec pgbackrest --config=/etc/pgbackrest/pgbackrest.conf --stanza=main --type="$backup_type" \
+  --log-level-console=info backup

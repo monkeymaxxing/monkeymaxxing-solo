@@ -1,0 +1,65 @@
+{{- /*
+  Where MMWatchdog on solo01 delivers its alerts, /etc/mmwatchdog/alert_destinations.yml.
+  It reads the role input alert_destination (vars.alert_destination from
+  mmx_project_settings.yml). The secrets are in files that the playbook's
+  stages for each kind write into /etc/mmwatchdog/secrets/ before this file
+  is checked: pushover-application-token, pushover-user-or-group-key,
+  slack-webhook-url, discord-webhook-url, telegram-bot-token,
+  alert-webhook-bearer-token, email-login-password.
+*/ -}}
+{{- $destination := .inputs.alert_destination -}}
+# Managed by MMX from roles/monitoring_and_outside_alarm/files/alert_destinations.yml
+# in the systems repository.
+{{- if not $destination.enabled }}
+# alert_destination.enabled is false in mmx_project_settings.yml, so there is
+# no destination and no alert pretends to reach a person. The alerts step of
+# the setup adds it.
+destinations: {}
+{{- else }}
+destinations:
+  alerts_to_you:
+{{- if eq $destination.kind "pushover" }}
+    pushover:
+      application_token_file: /etc/mmwatchdog/secrets/pushover-application-token
+      user_or_group_key_file: /etc/mmwatchdog/secrets/pushover-user-or-group-key
+      repeat_sos_alerts_every: 5m
+      stop_repeating_sos_alerts_after: 1h
+    # Pushover repeats an sos alert itself, until you acknowledge it.
+    remind_every: never
+{{- else if eq $destination.kind "slack" }}
+    slack:
+      webhook_url_file: /etc/mmwatchdog/secrets/slack-webhook-url
+    remind_every: 4h
+{{- else if eq $destination.kind "discord" }}
+    discord:
+      webhook_url_file: /etc/mmwatchdog/secrets/discord-webhook-url
+    remind_every: 4h
+{{- else if eq $destination.kind "telegram" }}
+    telegram:
+      bot_token_file: /etc/mmwatchdog/secrets/telegram-bot-token
+      chat_id: "{{ $destination.telegram_chat_id }}"
+    remind_every: 4h
+{{- else if eq $destination.kind "webhook" }}
+    webhook:
+      url: {{ $destination.webhook_url }}
+{{- if $destination.webhook_has_a_bearer_token }}
+      bearer_token_file: /etc/mmwatchdog/secrets/alert-webhook-bearer-token
+{{- end }}
+    remind_every: 4h
+{{- else if eq $destination.kind "email" }}
+    email:
+      smtp_server: {{ $destination.email_smtp_server }}
+      smtp_connection_security: {{ $destination.email_connection_security }}
+      from: {{ $destination.email_from }}
+      to: [{{ join ", " $destination.email_to }}]
+{{- if ne $destination.email_login_user "" }}
+      login_user: {{ $destination.email_login_user }}
+      login_password_file: /etc/mmwatchdog/secrets/email-login-password
+{{- end }}
+    remind_every: 4h
+{{- else }}
+{{ fail (printf "alert_destination.kind in mmx_project_settings.yml is %q. Use pushover, slack, discord, telegram, webhook or email. Nothing changed." $destination.kind) }}
+{{- end }}
+    # info is news that needs no action: it stays in MMWatchdog's own records.
+    alert_severities: [warn, sos]
+{{- end }}

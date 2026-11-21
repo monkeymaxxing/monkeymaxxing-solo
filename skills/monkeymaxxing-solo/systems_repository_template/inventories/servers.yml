@@ -1,0 +1,44 @@
+# The one server of this system, solo01, and the laptop that manages it.
+# SSH uses solo01's WireGuard address, through doubleshell, so solo01 has no
+# open SSH port (ssh/config). public_ipv4_address is the provider's address
+# for WireGuard packets only. Replace the public example in 203.0.113.0/24
+# with the address your provider gave solo01.
+vars:
+  # A private /16 that no other network of yours uses. Every WireGuard
+  # address is inside it. solo01 is 10.20.1.1 and your laptop is 10.20.10.1.
+  wireguard_network: 10.20.0.0/16
+  # The UDP port WireGuard listens on. 51820 is WireGuard's usual port and is
+  # above 1024, so no AppArmor rule is needed to bind it. The outside world
+  # reaches WireGuard on UDP 443: files_used_by_several_roles/wireguard_udp_443_redirect.nft
+  # redirects 443 to this port, so hotel and office networks, which let UDP
+  # 443 out, still work. Your laptop's doubleshell file uses port 443.
+  wireguard_listen_port: 51820
+
+  # Requested image tags. A tag is the app's full Git commit, 40 lowercase
+  # hexadecimal characters: one tag then always names one image. The playbooks
+  # refuse any other tag. deploy runs when you change a tag here and commit.
+  deployed_image_tags:
+    shop: "3f2a1c97d4e85b60a1c2d3e4f5061728394a5b6c"
+  # The public host name of each app, served through the Cloudflare Tunnel.
+  public_host_names:
+    shop: shop.example.com
+
+nodes:
+  solo01:
+    address: 10.20.1.1                    # WireGuard address, for SSH through doubleshell
+    connection: ssh_only
+    ssh_user: root
+    ssh_known_hosts: ssh/known_hosts
+    ssh_config: ssh/config
+    vars:
+      public_ipv4_address:                  # the setup fills it: from the provider, such as 203.0.113.10
+      private_ip: 10.20.1.1                 # solo01's WireGuard address
+      wireguard_public_key:                 # the setup fills it: printed when the setup makes solo01's WireGuard key
+      # Your laptop: its WireGuard address and public key. Only this one
+      # laptop is a WireGuard peer of solo01, and the only source of SSH.
+      laptop_private_ip: 10.20.10.1
+      laptop_wireguard_public_key:          # the setup fills it: from doubleshell create-wireguard-key
+
+groups:
+  solo_server:
+    nodes: [solo01]

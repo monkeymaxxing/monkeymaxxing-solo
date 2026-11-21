@@ -1,0 +1,61 @@
+name: Tests
+
+# Runs Monkeymaxxing Solo's full local test suite on every push and pull
+# request: the Cloudflare Worker outside alarm tests, the Python template and
+# MMX validation suite against the pinned MMX release, and the Go checks of
+# set-up-solo-services. No test needs a provider account or credential.
+
+on:
+  push:
+  pull_request:
+
+permissions: {}
+
+jobs:
+  tests:
+    name: Solo tests on Ubuntu
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6.1.0
+        env:
+          GOTOOLCHAIN: auto
+        with:
+          go-version-file: set_up_solo_services/go.mod
+          cache: false
+      - name: Build the MMX release that the template pins
+        env:
+          GOTOOLCHAIN: auto
+        shell: bash
+        run: |
+          settings=skills/monkeymaxxing-solo/systems_repository_template/mmx_project_settings.yml
+          mmx_version=$(awk '/^    mmx:$/ { found = 1; next } found && /version:/ { gsub(/"/, "", $2); print $2; exit }' "$settings")
+          if [ -z "$mmx_version" ]; then
+            echo "Cannot read solo_software.mmx.version from $settings." >&2; exit 1
+          fi
+          git clone --quiet --depth 1 --branch "v$mmx_version" https://github.com/monkeymaxxing/mmx "$RUNNER_TEMP/mmx"
+          # MMX reads official_extra_modules/ next to its binary, so the binary stays in the clone.
+          (cd "$RUNNER_TEMP/mmx" && CGO_ENABLED=0 go build -trimpath -o mmx ./cmd/mmx)
+          echo "MMX_BIN=$RUNNER_TEMP/mmx/mmx" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/mmx" >> "$GITHUB_PATH"
+      - name: Run the Cloudflare Worker outside alarm tests
+        shell: bash
+        run: node --test worker/solo_outside_alarm_worker_test.mjs
+      - name: Run every Python test in tests/
+        shell: bash
+        run: python3 -m unittest discover -s tests -p '*_test.py' -v
+      - name: Check set-up-solo-services with go vet, go test and gofmt
+        working-directory: set_up_solo_services
+        shell: bash
+        run: |
+          go vet ./...
+          GOOS=linux go vet ./...
+          go test -race -count=1 ./...
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            printf '%s\n' "$unformatted"; exit 1
+          fi

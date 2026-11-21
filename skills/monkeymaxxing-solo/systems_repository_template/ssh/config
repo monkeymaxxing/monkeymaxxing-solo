@@ -1,0 +1,25 @@
+# OpenSSH settings for solo01. MMX uses this file from the repository root.
+# solo01's SSH port is closed to the internet: doubleshell carries the SSH
+# connection inside WireGuard from this laptop, so no VPN interface appears
+# on the laptop. The setup writes ~/.config/doubleshell/solo01.conf (your
+# laptop's WireGuard address and solo01's public key and endpoint) and puts
+# the doubleshell program at ~/.local/bin/doubleshell. If the coding agent
+# installed doubleshell elsewhere, it writes that full path in the
+# ProxyCommand below.
+Host solo01 10.20.1.1
+  HostName 10.20.1.1
+  User root
+  # The key pair the setup made for this laptop. Its public half is in
+  # root_ssh_public_keys in mmx_project_settings.yml.
+  IdentityFile ~/.ssh/solo01
+  IdentitiesOnly yes
+  ForwardAgent no
+  # Trust only the host key committed in this repository.
+  UserKnownHostsFile ssh/known_hosts
+  # Refuse a new or changed host key instead of asking: a key is trusted only
+  # once it is added to ssh/known_hosts and committed.
+  StrictHostKeyChecking yes
+  # Keep the address readable in ssh/known_hosts, so the entry of a replaced
+  # server can be found and deleted.
+  HashKnownHosts no
+  ProxyCommand ~/.local/bin/doubleshell --wireguard-config ~/.config/doubleshell/solo01.conf proxy-ssh %h %p

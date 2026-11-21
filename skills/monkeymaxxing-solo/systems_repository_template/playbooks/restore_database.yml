@@ -1,0 +1,262 @@
+# Restores solo01's Postgres from the backups in the Cloudflare R2 bucket,
+# with pgBackRest, to the end of the archive or to a chosen moment, and runs
+# each app's restore_drill_check_queries on the restored database. Use it
+# when the database is lost or damaged:
+#
+#   # the newest data the archive holds
+#   mmx run restore_database --var confirm_this_replaces_the_current_database=true
+#
+#   # point-in-time recovery: the database as it was at a moment before a bad change
+#   mmx run restore_database --var confirm_this_replaces_the_current_database=true \
+#       --var target_time="2026-11-03 14:01:00+00"
+#
+# This REPLACES the live database. Reason for the required confirmation: the
+# playbook stops the apps and swaps the data directory. The old data
+# directory is not deleted: it is moved to
+# /var/lib/postgresql/<version>/main_replaced_by_restore_<UTC time>, so the
+# server needs free disk space as large as the database for the copy that the
+# restore writes, and you delete the moved directory yourself once you are
+# sure the restored database is right. Each run restores again and keeps
+# the database it replaced.
+#
+# A replacement server after a lost one: set up the new server's WireGuard
+# and run this playbook first, not solo_server. This playbook installs
+# Postgres and pgBackRest and writes pgBackRest's settings from the same
+# template as the backups, so the restore reads the repository exactly where
+# the backups wrote it. Then run solo_server, which writes the rest, finds
+# the stanza main already in the bucket, and starts the apps again. A
+# solo_server run first would create a new empty stanza and refuse to match
+# the bucket's.
+#
+# The steps:
+#   1. Refuse without the confirmation or with a target_time that is not
+#      "latest" or a time with its time zone.
+#   2. Install Postgres and pgBackRest, and write pgBackRest's settings.
+#   3. Stop the apps, stop Postgres, move the data directory aside, and
+#      restore into an empty one.
+#   4. Turn archiving on again for the restored cluster, which pgBackRest
+#      restores with archive_mode off, so production's bucket gets no second
+#      history of the lost database until you meant it to. Restarting the
+#      cluster starts the archive of the new timeline.
+#   5. Run each app's restore_drill_check_queries read-only; each must
+#      answer true.
+#   6. Start the apps again.
+command_line_vars:
+  confirm_this_replaces_the_current_database:
+    type: boolean
+    default: false
+  # latest, or a time with its time zone, such as "2026-11-03 14:01:00+00".
+  # The form is YYYY-MM-DD HH:MM, optional seconds, and Z, +HH, -HH, +HH:MM or -HH:MM.
+  target_time:
+    type: string
+    default: latest
+
+fleet_stages:
+  - id: refuse_without_the_confirmation_or_with_a_bad_target_time
+    nodes: solo_server
+    on_node_failure: stop_run
+    node_tasks:
+      - id: the_person_confirmed_the_replacement
+        assert:
+          that: "{{ .vars.confirm_this_replaces_the_current_database }}"
+          message: >-
+            restore_database replaces the live database on solo01 with the newest
+            backup in the R2 bucket, or the backup at target_time. Add
+            --var confirm_this_replaces_the_current_database=true to run it after you
+            decided that. The current data directory is kept, moved aside. Nothing
+            changed.
+      - id: the_target_time_is_latest_or_a_time_with_its_time_zone
+        assert:
+          that:
+            matches: ["{{ .vars.target_time }}", '^(latest|[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}(:[0-9]{2})?(Z|[+-][0-9]{2}(:[0-9]{2})?))$']
+          message: >-
+            target_time is "{{ .vars.target_time }}". Use latest, or a time with its time
+            zone, such as "2026-11-03 14:01:00+00". Nothing changed.
+      - id: the_backup_settings_are_filled_in
+        assert:
+          that:
+            matches: ["{{ .vars.backups.r2_s3_endpoint }}", '^[0-9a-f]{32}(\.(eu|fedramp))?\.r2\.cloudflarestorage\.com$']
+          message: >-
+            backups.r2_s3_endpoint in mmx_project_settings.yml is
+            "{{ .vars.backups.r2_s3_endpoint }}". Write your Cloudflare account's R2
+            address without "https://". Nothing changed.
+
+  - id: install_postgres_and_pgbackrest_and_write_the_backup_settings
+    nodes: solo_server
+    on_node_failure: stop_run
+    node_tasks:
+      # Installing postgresql-17 creates Debian's own cluster main, empty, on a
+      # new server. The restore below moves that empty directory aside.
+      - id: install_postgres_and_pgbackrest
+        apt_package:
+          packages:
+            - {name: "postgresql-{{ .vars.postgresql_major_version }}", version: newest_when_first_installed}
+            - {name: pgbackrest, version: newest_when_first_installed}
+            - {name: python3, version: newest_when_first_installed}
+      - id: create_the_pgbackrest_settings_directory
+        directory:
+          path: /etc/pgbackrest
+          owner: root
+          group: root
+          permissions_mode: "0755"
+      - id: name_the_pgbackrest_settings
+        set_vars:
+          pgbackrest_settings:
+            r2_s3_endpoint: "{{ .vars.backups.r2_s3_endpoint }}"
+            bucket_name: "{{ .vars.backups.bucket_name }}"
+            bucket_key_id: "{{ .secrets.pgbackrest_r2_access_key_id }}"
+            bucket_secret_key: "{{ .secrets.pgbackrest_r2_secret_access_key }}"
+            repository_cipher_passphrase: "{{ .secrets.pgbackrest_repository_cipher_passphrase }}"
+            data_directory: "/var/lib/postgresql/{{ .vars.postgresql_major_version }}/main"
+            keep_database_backups_for_days: "{{ .vars.backups.keep_database_backups_for_days }}"
+            lock_backups_against_deletion_for_days: "{{ .vars.backups.lock_backups_against_deletion_for_days }}"
+      - id: write_the_pgbackrest_settings
+        file:
+          path: /etc/pgbackrest/pgbackrest.conf
+          template: files_used_by_several_roles/pgbackrest.conf
+          owner: root
+          group: postgres
+          permissions_mode: "0640"
+          secret_readable_by_group: true
+
+  - id: stop_the_apps_and_restore_the_database
+    nodes: solo_server
+    on_node_failure: stop_run
+    node_tasks:
+      # No app writes to the database while the data directory is swapped.
+      # Each unit is stopped by name, whether it runs or not; a server with no
+      # containers yet has none, and the unit names that do not exist are
+      # ignored.
+      - id: stop_the_apps
+        shell:
+          script: |
+            for app in $(python3 -I -c 'import json,os; print(" ".join(sorted(json.loads(os.environ["APPS"]))))'); do
+              systemctl stop "$app-jobs.service" "$app-web-*.service" 2>/dev/null || true
+            done
+          dryrun: printf 'would stop the web and job containers of every app\n'
+          env:
+            APPS: "{{ .vars.apps }}"
+          changed_when: false
+      - id: stop_the_cluster
+        systemd_service:
+          name: "postgresql@{{ .vars.postgresql_major_version }}-main"
+          state: stopped
+      - id: move_the_current_data_directory_aside
+        shell:
+          script: |
+            data="/var/lib/postgresql/$POSTGRESQL_MAJOR_VERSION/main"
+            if [ -d "$data" ] && [ -n "$(ls -A "$data" 2>/dev/null)" ]; then
+              aside="/var/lib/postgresql/$POSTGRESQL_MAJOR_VERSION/main_replaced_by_restore_$(date -u +%Y%m%dT%H%M%SZ)"
+              mv "$data" "$aside"
+              printf 'moved %s to %s\n' "$data" "$aside"
+            fi
+            install -d -o postgres -g postgres -m 0700 "$data"
+          dryrun: printf 'would move the current data directory aside and make an empty one\n'
+          env:
+            POSTGRESQL_MAJOR_VERSION: "{{ .vars.postgresql_major_version }}"
+      - id: restore_the_database
+        time_limit: 4h
+        pgbackrest_restore:
+          stanza: main
+          config_file: /etc/pgbackrest/pgbackrest.conf
+          data_directory: "/var/lib/postgresql/{{ .vars.postgresql_major_version }}/main"
+          postgresql_major_version: "{{ .vars.postgresql_major_version }}"
+          recover_to: "{{ .vars.target_time }}"
+
+  # The module restores the cluster with archive_mode off in
+  # postgresql.auto.conf. Resetting it and restarting the cluster turns the
+  # archive on again; pgBackRest then archives the restored cluster's new
+  # timeline into the same stanza. On a new server whose
+  # 10-monkeymaxxing-solo.conf does not exist yet, solo_server writes the
+  # archive settings next.
+  - id: turn_archiving_on_again
+    nodes: solo_server
+    on_node_failure: stop_run
+    node_tasks:
+      - id: reset_archive_mode_and_stop_restored_cluster
+        shell:
+          script: |
+            set -eu
+            pgbin="/usr/lib/postgresql/$POSTGRESQL_MAJOR_VERSION/bin"
+            data="/var/lib/postgresql/$POSTGRESQL_MAJOR_VERSION/main"
+            runuser -u postgres -- "$pgbin/psql" --no-psqlrc --quiet --port 5432 --command "ALTER SYSTEM RESET archive_mode"
+            # pgbackrest_restore starts the restored cluster directly with pg_ctl
+            # (with archive_mode = off in postgresql.auto.conf). Stop it cleanly
+            # so systemd starts postgresql@<version>-main with archive_mode = on
+            # from conf.d/10-monkeymaxxing-solo.conf.
+            systemctl stop "postgresql@${POSTGRESQL_MAJOR_VERSION}-main" 2>/dev/null || true
+            if [ -f "$data/postmaster.pid" ]; then
+              runuser -u postgres -- "$pgbin/pg_ctl" --pgdata="$data" --mode=fast --wait stop
+            fi
+          dryrun: printf 'would reset archive_mode and stop the restored cluster so systemd restarts it cleanly\n'
+          env:
+            POSTGRESQL_MAJOR_VERSION: "{{ .vars.postgresql_major_version }}"
+      - id: start_the_cluster
+        systemd_service:
+          name: "postgresql@{{ .vars.postgresql_major_version }}-main"
+          state: running
+      - id: wait_until_the_cluster_accepts_connections
+        wait_for:
+          command_succeeds: '"/usr/lib/postgresql/$POSTGRESQL_MAJOR_VERSION/bin/pg_isready" --quiet --port 5432'
+          env:
+            POSTGRESQL_MAJOR_VERSION: "{{ .vars.postgresql_major_version }}"
+          wait_at_most: 2m
+
+  # Each app's restore_drill_check_queries, read-only, on the restored copy.
+  # Every query must answer true. A restored copy with no data or old data
+  # fails.
+  - id: run_each_apps_check_queries_on_the_restored_database
+    nodes: solo_server
+    on_node_failure: stop_run
+    node_tasks:
+      - id: run_the_check_queries
+        shell:
+          script: |
+            python3 -I - <<'PYTHON'
+            import json, os, subprocess, sys
+            apps = json.loads(os.environ['APPS'])
+            failed = []
+            for app_name, app in sorted(apps.items()):
+                for query in app['restore_drill_check_queries']:
+                    done = subprocess.run(
+                        ['/usr/lib/postgresql/' + os.environ['POSTGRESQL_MAJOR_VERSION'] + '/bin/psql', '--no-psqlrc', '--tuples-only', '--no-align',
+                         '--set', 'ON_ERROR_STOP=1', '--port', '5432', '--dbname', app['database_name'], '--command', query['sql']],
+                        capture_output=True, text=True, env=dict(os.environ, PGOPTIONS='-c default_transaction_read_only=on'))
+                    answer = done.stdout.strip() if done.returncode == 0 else done.stderr.strip()
+                    print('%s/%s: %s' % (app_name, query['name'], answer))
+                    if done.returncode != 0 or answer != 't':
+                        failed.append(app_name + '/' + query['name'])
+            if failed:
+                print('These queries did not answer true on the restored database: ' + ', '.join(failed), file=sys.stderr)
+                sys.exit(1)
+            PYTHON
+          dryrun: printf 'would run each app check queries on the restored database\n'
+          run_as_user_account: postgres
+          env:
+            APPS: "{{ .vars.apps }}"
+            POSTGRESQL_MAJOR_VERSION: "{{ .vars.postgresql_major_version }}"
+          changed_when: false
+
+  - id: start_the_apps_again
+    nodes: solo_server
+    node_tasks:
+      - id: start_the_apps
+        shell:
+          script: |
+            set -eu
+            for app in $(python3 -I -c 'import json,os; print(" ".join(sorted(json.loads(os.environ["APPS"]))))'); do
+              if [ -f "/etc/containers/systemd/$app-jobs.container" ]; then
+                systemctl start "$app-jobs.service"
+              fi
+              port_file="/var/lib/solo/live_web_ports/$app"
+              if [ -f "$port_file" ]; then
+                port=$(tr -d '[:space:]' < "$port_file")
+                if [ -n "$port" ] && [ -f "/etc/containers/systemd/$app-web-$port.container" ]; then
+                  systemctl start "$app-web-$port.service"
+                fi
+              fi
+            done
+          dryrun: printf 'would start the web and job containers of every app\n'
+          env:
+            APPS: "{{ .vars.apps }}"
+          changed_when: false

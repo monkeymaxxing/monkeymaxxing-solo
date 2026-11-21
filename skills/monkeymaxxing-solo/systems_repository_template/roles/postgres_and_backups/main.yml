@@ -1,0 +1,351 @@
+# Postgres on solo01 and its backups: plain Debian Postgres, one cluster named
+# main; the apps' databases and their login roles; who may log in
+# (pg_hba.conf); pgBackRest, which sends every change and the backups to a
+# Cloudflare R2 bucket; and the weekly local restore check, which restores the
+# newest backup into a throwaway Postgres on a private Unix socket and checks
+# the data.
+#
+# One server has nothing to fail over to, so Solo runs the cluster that
+# Debian's own packaging creates, as the Monkeymaxxing Stack's staging01 does,
+# and not pg_auto_failover. The Stack adds pg_auto_failover when you move to
+# several database servers.
+#
+# Playbooks that call this role: solo_server (every run).
+inputs:
+  postgresql_major_version:
+    type: integer
+    required: true
+  private_ip:                               # solo01's WireGuard address, the only address where Postgres listens
+    type: string
+    required: true
+  nightly_work_starts_at:                   # vars.nightly_work_starts_at: UTC "HH:MM"
+    type: string
+    required: true
+  weekly_work_day:                          # vars.weekly_work_day: the full backup and the restore check
+    type: string
+    required: true
+  apps:                                     # vars.apps from mmx_project_settings.yml
+    type: mapping
+    required: true
+  backups:                                  # vars.backups from mmx_project_settings.yml
+    type: mapping
+    required: true
+  database_passwords:                       # each app database's login password, by database name, such as shop
+    type: mapping
+    required: true
+    secret: true
+  backup_bucket_key_id:                     # the R2 key that can write objects to the backup bucket: its access key ID
+    type: string
+    required: true
+    secret: true
+  backup_bucket_secret_key:                 # the R2 key's secret access key
+    type: string
+    required: true
+    secret: true
+  backup_repository_cipher_passphrase:      # pgBackRest uses the passphrase to encrypt every file before the file leaves the server
+    type: string
+    required: true
+    secret: true
+
+node_tasks:
+  # Where Debian keeps the cluster main. pg_hba_file is the file whose
+  # include line below brings in the apps' logins.
+  - id: name_the_files_of_the_cluster
+    set_vars:
+      data_directory: "/var/lib/postgresql/{{ .inputs.postgresql_major_version }}/main"
+      pg_hba_file: "/etc/postgresql/{{ .inputs.postgresql_major_version }}/main/pg_hba.conf"
+      postgresql_service: "postgresql@{{ .inputs.postgresql_major_version }}-main"
+  # The differential backups run on the six days other than weekly_work_day.
+  # systemd has no "every day except", so the role looks them up here.
+  - id: name_the_days_other_than_each_day
+    set_vars:
+      days_other_than:
+        monday: tuesday,wednesday,thursday,friday,saturday,sunday
+        tuesday: monday,wednesday,thursday,friday,saturday,sunday
+        wednesday: monday,tuesday,thursday,friday,saturday,sunday
+        thursday: monday,tuesday,wednesday,friday,saturday,sunday
+        friday: monday,tuesday,wednesday,thursday,saturday,sunday
+        saturday: monday,tuesday,wednesday,thursday,friday,sunday
+        sunday: monday,tuesday,wednesday,thursday,friday,saturday
+
+  # Postgres, pgBackRest and needrestart come from Debian. Installing
+  # postgresql-17 creates Debian's own cluster main on port 5432.
+  - id: install_postgres_and_pgbackrest
+    apt_package:
+      packages:
+        - {name: "postgresql-{{ .inputs.postgresql_major_version }}", version: newest_when_first_installed}
+        - {name: pgbackrest, version: newest_when_first_installed}
+        - {name: needrestart, version: newest_when_first_installed}
+  - id: start_debians_clusters_at_boot
+    systemd_service:
+      name: postgresql
+      state: running
+      start_at_boot: true
+  - id: run_debians_cluster_main
+    systemd_service:
+      name: "{{ .vars.postgresql_service }}"
+      state: running
+
+  # Postgres binds its address when it starts, so at boot its service waits
+  # for wg0, which holds the address. The drop-in changes the unit that
+  # Debian's package writes. Changing the boot order needs no restart.
+  - id: start_the_cluster_after_the_wireguard_network
+    systemd_unit:
+      name: "{{ .vars.postgresql_service }}.service"
+      drop_in: 10-after-wireguard.conf
+      content: |
+        # Managed by MMX from roles/postgres_and_backups/main.yml in the systems repository.
+        [Unit]
+        After=wg-quick@wg0.service
+        Wants=wg-quick@wg0.service
+
+  # pgBackRest's settings name the bucket, the bucket's key, and the
+  # encryption passphrase. files_used_by_several_roles/pgbackrest.conf
+  # supplies /etc/pgbackrest/pgbackrest.conf, and playbooks/restore_database.yml
+  # writes it from the same template, so a restore reads the backup storage
+  # the backups wrote. The group postgres reads the file, because pgBackRest
+  # runs as postgres. It comes before the Postgres settings below, because
+  # Postgres runs pgBackRest's archive-push as soon as archiving is on.
+  - id: create_the_pgbackrest_settings_directory
+    directory:
+      path: /etc/pgbackrest
+      owner: root
+      group: root
+      permissions_mode: "0755"
+  - id: name_the_pgbackrest_settings
+    set_vars:
+      pgbackrest_settings:
+        r2_s3_endpoint: "{{ .inputs.backups.r2_s3_endpoint }}"
+        bucket_name: "{{ .inputs.backups.bucket_name }}"
+        bucket_key_id: "{{ .inputs.backup_bucket_key_id }}"
+        bucket_secret_key: "{{ .inputs.backup_bucket_secret_key }}"
+        repository_cipher_passphrase: "{{ .inputs.backup_repository_cipher_passphrase }}"
+        data_directory: "{{ .vars.data_directory }}"
+        keep_database_backups_for_days: "{{ .inputs.backups.keep_database_backups_for_days }}"
+        lock_backups_against_deletion_for_days: "{{ .inputs.backups.lock_backups_against_deletion_for_days }}"
+  - id: write_the_pgbackrest_settings
+    file:
+      path: /etc/pgbackrest/pgbackrest.conf
+      template: ../../files_used_by_several_roles/pgbackrest.conf
+      owner: root
+      group: postgres
+      permissions_mode: "0640"
+      secret_readable_by_group: true
+
+  # Postgres's settings, in the cluster's conf.d, which Debian's
+  # postgresql.conf reads last, so these override it. The cluster listens
+  # only on solo01's WireGuard address, where the apps' containers connect
+  # from the server's own network, so no other address of the server reaches
+  # Postgres, whatever the firewall says. Local tools use the socket.
+  #
+  # - shared_buffers = 128MB, Postgres's default. Postgres keeps a modest
+  #   buffer on a 4 GB server, so that two releases of an app fit in memory
+  #   during a deploy; the operating system's page cache holds the data that
+  #   does not fit.
+  # - Archiving: Postgres hands each finished segment of its write-ahead log,
+  #   the record of every change, to pgBackRest, which sends it to the
+  #   bucket. archive_timeout targets a segment switch every 60 seconds when
+  #   there is database activity. Uploads can take longer or fail, so
+  #   archive_timeout does not guarantee a maximum of one minute of lost
+  #   data.
+  # listen_addresses and archive_mode take effect only when Postgres
+  # restarts, so a change restarts the cluster at once: the apps reconnect
+  # by themselves. The same restart is why the settings come before the
+  # apps' containers in playbooks/solo_server.yml.
+  - task_block:
+      id: postgres_settings
+      changes:
+        - id: write_the_postgres_settings
+          file:
+            path: "/etc/postgresql/{{ .inputs.postgresql_major_version }}/main/conf.d/10-monkeymaxxing-solo.conf"
+            content: |
+              # Managed by MMX from roles/postgres_and_backups/main.yml in the systems repository.
+              listen_addresses = '{{ .inputs.private_ip }}'
+              shared_buffers = 128MB
+              archive_mode = on
+              archive_command = 'pgbackrest --config=/etc/pgbackrest/pgbackrest.conf --stanza=main archive-push %p'
+              archive_timeout = 60
+            owner: postgres
+            group: postgres
+            permissions_mode: "0644"
+      activate:
+        - id: restart_debians_cluster_main
+          systemd_service:
+            name: "{{ .vars.postgresql_service }}"
+            state: running
+            refresh: restart
+      verify:
+        - id: wait_until_debians_cluster_accepts_connections
+          wait_for:
+            command_succeeds: '"/usr/lib/postgresql/$POSTGRESQL_MAJOR_VERSION/bin/pg_isready" --quiet --port 5432'
+            env:
+              POSTGRESQL_MAJOR_VERSION: "{{ .inputs.postgresql_major_version }}"
+            wait_at_most: 60s
+
+  # Who may log in, in pg_hba.conf, the first matching line deciding. Debian's
+  # local rules stay: through the local socket an account logs in only as the
+  # role of its own name (peer), and through the loopback address only with a
+  # password. pgBackRest, MMX's Postgres modules and MMWatchdog log in through
+  # the local socket as postgres.
+  #
+  # The apps' login rules live in /etc/postgresql/pg_hba_logins_of_the_apps.conf,
+  # which pg_hba.conf includes, so MMX tracks a file that only MMX changes.
+  # include_the_logins_of_the_apps_in_pg_hba_conf runs before postgres_logins,
+  # so the reload loads the include line too. The include_if_exists line lets
+  # Postgres load pg_hba.conf while the apps' file is missing. The apps' rules
+  # match none of Debian's, because an app logs in with its own password from
+  # solo01's WireGuard address.
+  - id: include_the_logins_of_the_apps_in_pg_hba_conf
+    line:
+      path: "{{ .vars.pg_hba_file }}"
+      line: include_if_exists /etc/postgresql/pg_hba_logins_of_the_apps.conf
+      insert_at_end_of_file: true
+  - task_block:
+      id: postgres_logins
+      changes:
+        - id: write_the_logins_of_the_apps
+          file:
+            path: /etc/postgresql/pg_hba_logins_of_the_apps.conf
+            template: files/pg_hba_logins_of_the_apps.conf
+            owner: root
+            group: postgres
+            permissions_mode: "0640"
+      activate:
+        # Postgres reads pg_hba.conf again without dropping a connection.
+        - id: reload_postgres
+          shell:
+            script: '"/usr/lib/postgresql/$POSTGRESQL_MAJOR_VERSION/bin/psql" --no-psqlrc --quiet --port 5432 --command "select pg_reload_conf()"'
+            run_as_user_account: postgres
+            env:
+              POSTGRESQL_MAJOR_VERSION: "{{ .inputs.postgresql_major_version }}"
+            only_when_tracked_inputs_changed: true
+
+  # The apps' databases and their logins. Each database's collation is
+  # C.UTF-8, which sorts by code point and never changes with the operating
+  # system's C library, so a database that moves to a server on a newer
+  # Debian release keeps its indexes valid.
+  - id: login_role_of_each_app
+    loop: "{{ .inputs.apps }}"
+    as: app
+    postgresql_role:
+      name: "{{ .app.value.database_name }}"
+      password: "{{ .inputs.database_passwords[.app.value.database_name] }}"
+      can_log_in: true
+      superuser: false
+      can_create_databases: false
+      can_create_roles: false
+      can_start_replication: false
+      member_of_roles: []
+      member_of_roles_not_listed: remove
+  - id: database_of_each_app
+    loop: "{{ .inputs.apps }}"
+    as: app
+    postgresql_database:
+      name: "{{ .app.value.database_name }}"
+      owner: "{{ .app.value.database_name }}"
+      encoding: UTF8
+      locale: C.UTF-8
+      template_database: template0
+
+  # The backups. The stanza main is pgBackRest's name for this cluster, its
+  # backups, and its archive in the bucket. pgbackrest_stanza creates the
+  # stanza, then checks that a segment of the write-ahead log reaches the
+  # bucket. A new stanza gets a first full backup at once, so MMWatchdog's
+  # latest_backup_is_less_than_26_hours_old check passes from the first day.
+  - id: install_the_program_that_backs_up_the_database
+    file:
+      path: /usr/local/sbin/back_up_the_database
+      source: files/back_up_the_database
+      owner: root
+      group: root
+      permissions_mode: "0755"
+  - id: pgbackrest_stanza_main
+    pgbackrest_stanza:
+      stanza: main
+      config_file: /etc/pgbackrest/pgbackrest.conf
+  - id: first_full_backup_of_a_new_stanza
+    when: "{{ .node_tasks.pgbackrest_stanza_main.created }}"
+    shell:
+      script: /usr/local/sbin/back_up_the_database full
+      run_as_user_account: postgres
+    time_limit: 1h
+
+  # A full backup every weekly_work_day and a differential backup, of what
+  # changed since the full backup, on the other six days, at
+  # nightly_work_starts_at (UTC, 01:00 in the template). A timer whose time
+  # passed while the server was off runs when the server next starts.
+  # pgBackRest keeps full backups for backups.keep_database_backups_for_days,
+  # so a restore reaches any moment of that period.
+  - id: full_backup_every_week
+    systemd_scheduled_job:
+      name: pgbackrest_full_backup
+      systemd_calendar_schedule: "{{ .inputs.weekly_work_day }} *-*-* {{ .inputs.nightly_work_starts_at }}:00"
+      run_missed_job_after_downtime: true
+      run_as_user_account: postgres
+      script: exec /usr/local/sbin/back_up_the_database full
+  - id: differential_backup_every_other_day
+    systemd_scheduled_job:
+      name: pgbackrest_differential_backup
+      systemd_calendar_schedule: "{{ .vars.days_other_than[.inputs.weekly_work_day] }} *-*-* {{ .inputs.nightly_work_starts_at }}:00"
+      run_missed_job_after_downtime: true
+      run_as_user_account: postgres
+      script: exec /usr/local/sbin/back_up_the_database diff
+
+  # The weekly local restore check. Two hours after the full backup starts,
+  # on weekly_work_day, the check restores the newest backup into a scratch
+  # directory, starts a throwaway Postgres on it with the postgres program
+  # that this role already installed (listening only on a Unix socket inside
+  # the scratch directory, with no network port), runs each app's
+  # restore_drill_check_queries read-only, and stops that Postgres and removes
+  # the directory, whether the check passed or failed. It proves that the
+  # backup is intact and that the encryption passphrase works, with no
+  # provider API key, no second server, and no download. Reason for not using
+  # a container image: a pull from a public registry can be refused for a
+  # busy shared address, costs about 450 MB of disk, and the image's Postgres
+  # can differ from the live one. MMWatchdog checks that the result,
+  # /var/lib/solo-restore-check/last-result.json, is fresh and says "passed".
+  - id: create_the_settings_directory_of_solo
+    directory:
+      path: /etc/solo
+      owner: root
+      group: root
+      permissions_mode: "0755"
+  - id: write_the_settings_of_the_restore_check
+    file:
+      path: /etc/solo/restore_check_settings.json
+      template: files/restore_check_settings.json
+      owner: root
+      group: root
+      permissions_mode: "0644"
+  - id: create_the_directory_of_the_restore_check
+    directory:
+      path: /var/lib/solo-restore-check
+      owner: root
+      group: root
+      permissions_mode: "0755"
+  - id: install_the_program_that_runs_the_restore_check
+    file:
+      path: /usr/local/sbin/run_local_restore_check
+      source: files/run_local_restore_check
+      owner: root
+      group: root
+      permissions_mode: "0755"
+  # The unit files are templates, because the check starts 2 hours after the
+  # full backup starts and a task field cannot do that arithmetic.
+  - task_block:
+      id: weekly_local_restore_check
+      changes:
+        - id: install_the_restore_check_service
+          systemd_unit:
+            name: solo_restore_check.service
+            template: files/solo_restore_check.service
+        - id: install_the_restore_check_timer
+          systemd_unit:
+            name: solo_restore_check.timer
+            template: files/solo_restore_check.timer
+      activate:
+        - id: run_the_restore_check_timer
+          systemd_service:
+            name: solo_restore_check.timer
+            state: running
+            start_at_boot: true

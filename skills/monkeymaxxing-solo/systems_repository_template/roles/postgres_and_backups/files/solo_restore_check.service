@@ -1,0 +1,12 @@
+# Managed by MMX from roles/postgres_and_backups/files/solo_restore_check.service in the systems repository.
+[Unit]
+Description=Restore the newest database backup into a throwaway Postgres and check it
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/run_local_restore_check
+# A restore that takes longer than this is stuck; the program removes the
+# throwaway Postgres and the scratch directory at the start of the next check anyway.
+TimeoutStartSec=3h

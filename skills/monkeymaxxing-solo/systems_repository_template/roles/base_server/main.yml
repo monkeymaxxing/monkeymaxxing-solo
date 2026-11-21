@@ -1,0 +1,461 @@
+# What solo01 gets before any service runs: its name, SSH, the firewall, the
+# WireGuard network, journal size limits, security updates, the container
+# security profile, and the MMWatchdog release.
+#
+# The firewall admits only two kinds of traffic from the internet: UDP 443,
+# which the nftables redirect turns into WireGuard's own port, and UDP
+# wireguard_listen_port itself. SSH listens only on solo01's WireGuard
+# address, and the firewall admits it only on wg0, from your laptop's
+# WireGuard address. No web port is open: cloudflared dials out to
+# Cloudflare and hands requests to Caddy on 127.0.0.1.
+inputs:
+  private_ip:                               # solo01's WireGuard address, from inventories/servers.yml
+    type: string
+    required: true
+  wireguard_listen_port:                    # from inventories/servers.yml
+    type: integer
+    required: true
+  laptop_private_ip:                        # the laptop's WireGuard address
+    type: string
+    required: true
+  laptop_wireguard_public_key:
+    type: string
+    required: true
+  root_ssh_public_keys:                     # exactly the keys that may log in as root
+    type: list
+    required: true
+  mmwatchdog_release:                       # version, download_url, and sha256
+    type: mapping
+    required: true
+
+node_tasks:
+  # MMWatchdog's apt_security_updates reads this successful-refresh stamp.
+  # Debian does not write the stamp by default. The hook must exist before
+  # any package task can refresh apt's lists.
+  - id: write_the_successful_package_list_refresh_stamp_hook
+    file:
+      path: /etc/apt/apt.conf.d/15update-stamp
+      content: |
+        APT::Update::Post-Invoke-Success {"touch /var/lib/apt/periodic/update-success-stamp 2>/dev/null || true";};
+      owner: root
+      group: root
+      permissions_mode: "0644"
+
+  # MMWatchdog names the server by its host name, so the host name is the
+  # inventory name.
+  - id: set_the_host_name_to_the_inventory_name
+    hostname:
+      name: "{{ .node.name }}"
+
+  # Some providers' images run cloud-init at every boot. At the first boot,
+  # cloud-init makes SSH access possible. MMX configures the server after the
+  # first boot, and this file turns cloud-init off for every later boot, so
+  # cloud-init cannot rewrite /etc/hosts or the host name.
+  - id: turn_cloud_init_off_after_the_first_boot
+    file:
+      path: /etc/cloud/cloud-init.disabled
+      content: |
+        # Written by MMX: cloud-init set this server up at its first boot;
+        # MMX sets it up from then on.
+      owner: root
+      group: root
+      permissions_mode: "0644"
+  - id: write_the_names_of_the_server
+    file:
+      path: /etc/hosts
+      template: files/hosts
+      owner: root
+      group: root
+      permissions_mode: "0644"
+
+  # Root's authorized_keys holds exactly root_ssh_public_keys. Removing a key
+  # from root_ssh_public_keys removes the key's access at the next run.
+  - id: create_the_ssh_directory_of_root
+    directory:
+      path: /root/.ssh
+      owner: root
+      group: root
+      permissions_mode: "0700"
+  - id: admit_exactly_the_root_ssh_keys
+    authorized_keys:
+      for_user_account: root
+      keys: "{{ .inputs.root_ssh_public_keys }}"
+      keys_not_listed: remove
+
+  # sshd listens only on solo01's WireGuard address, with key-only root login.
+  # A boot that starts sshd before wg0 exists would fail to bind the address,
+  # so the drop-in starts sshd after wg-quick@wg0.service.
+  - task_block:
+      id: sshd_settings
+      changes:
+        - id: write_the_sshd_settings
+          file:
+            path: /etc/ssh/sshd_config.d/10-monkeymaxxing-solo.conf
+            content: |
+              # Managed by MMX. sshd keeps the first value it reads, and this
+              # file sorts before the distribution's and the provider's files.
+              ListenAddress {{ .inputs.private_ip }}
+              PermitRootLogin prohibit-password
+              PasswordAuthentication no
+              KbdInteractiveAuthentication no
+            owner: root
+            group: root
+            permissions_mode: "0644"
+        - id: start_sshd_after_the_wireguard_network
+          systemd_unit:
+            name: ssh.service
+            drop_in: 10-after-wireguard.conf
+            content: |
+              # Managed by MMX from roles/base_server/main.yml in the systems repository.
+              [Unit]
+              After=wg-quick@wg0.service
+              Wants=wg-quick@wg0.service
+      # If sshd -t rejects the configuration, the block fails before sshd
+      # reloads. The running sshd keeps its settings.
+      validate:
+        - id: check_the_whole_sshd_configuration
+          shell:
+            script: sshd -t
+            dryrun: sshd -t
+            changed_when: false
+      activate:
+        - id: reload_sshd
+          systemd_service:
+            name: ssh
+            state: running
+            refresh: reload
+
+  # The firewall. The wg0 rule for SSH works before WireGuard exists, because
+  # ufw matches an interface by name. MMX refuses a change that would leave
+  # SSH blocked.
+  - id: install_ufw
+    apt_package:
+      packages:
+        - {name: ufw, version: newest_when_first_installed}
+
+  # WireGuard listens on wireguard_listen_port (inventories/servers.yml says
+  # why), and the outside world reaches it on UDP 443. The redirect comes
+  # before the wireguard_interface task below, which may change ListenPort: a
+  # peer that still sends to UDP 443 then never meets a closed port. The unit
+  # loads the redirect before wg-quick@wg0.service on every boot.
+  - task_block:
+      id: wireguard_udp_443_redirect
+      changes:
+        - id: install_nftables
+          apt_package:
+            packages:
+              - {name: nftables, version: newest_when_first_installed}
+        - id: create_the_wireguard_directory
+          directory:
+            path: /etc/wireguard
+            owner: root
+            group: root
+            permissions_mode: "0700"
+        - id: write_the_udp_443_redirect
+          file:
+            path: /etc/wireguard/wireguard_udp_443_redirect.nft
+            template: ../../files_used_by_several_roles/wireguard_udp_443_redirect.nft
+            owner: root
+            group: root
+            permissions_mode: "0644"
+            check_new_file:
+              shell:
+                script: nft --check --file "$NEW_FILE"
+                dryrun: nft --check --file "$NEW_FILE"
+                env: {NEW_FILE: "{{ .new_file.path }}"}
+        - id: install_the_udp_443_redirect_unit
+          systemd_unit:
+            name: wireguard-udp-443-redirect.service
+            template: ../../files_used_by_several_roles/wireguard_udp_443_redirect.service
+        # Linux picks NAT only for a flow's first packet, so a laptop's
+        # keepalive flow to UDP 443 that began before the redirect stays
+        # unredirected and never recovers. Forgetting those flows lets the
+        # next packet be redirected.
+        - id: install_conntrack
+          apt_package:
+            packages:
+              - {name: conntrack, version: newest_when_first_installed}
+        - id: forget_udp_443_flows_after_a_port_change
+          systemd_unit:
+            name: wg-quick@wg0.service
+            drop_in: forget_udp_443_flows_after_a_port_change.conf
+            content: |
+              # Managed by MMX. After WireGuard starts or reloads, forget the old
+              # UDP 443 flows (a flow keeps the NAT choice of its first packet).
+              # The leading "-" ignores exit 1 when no flow exists.
+              [Service]
+              ExecStartPost=-/usr/sbin/conntrack -D -p udp --orig-port-dst 443
+              ExecReload=-/usr/sbin/conntrack -D -p udp --orig-port-dst 443
+      activate:
+        - id: reload_the_systemd_units_for_the_wireguard_drop_in
+          shell: {script: systemctl daemon-reload, dryrun: 'true'}
+        - id: run_the_udp_443_redirect
+          systemd_service:
+            name: wireguard-udp-443-redirect.service
+            state: running
+            start_at_boot: true
+            refresh: restart
+
+  - id: firewall
+    ufw:
+      default_incoming: deny
+      default_outgoing: allow
+      incoming_rules:
+        # WireGuard, from anywhere: the laptop roams between networks. UDP 443
+        # reaches the same service through the nftables redirect, which
+        # rewrites the port before ufw's filter sees the packet, so the rule
+        # for the real port covers both; the rule for 443 is kept for a
+        # redirect that is not loaded yet.
+        - {action: allow, protocol: udp, port: 443}
+        - {action: allow, protocol: udp, port: "{{ .inputs.wireguard_listen_port }}"}
+        # SSH, only on wg0 and only from the laptop's WireGuard address.
+        - {action: allow, protocol: tcp, port: 22, incoming_interface: wg0, from: "{{ .inputs.laptop_private_ip }}"}
+      incoming_rules_not_listed: remove
+      outgoing_rules:
+        # First-boot metadata can hold the WireGuard key; block HTTP to it on
+        # IPv4 and IPv6, so an app container cannot read it.
+        - {action: deny, protocol: tcp, port: 80, to: 169.254.169.254}
+        - {action: deny, protocol: tcp, port: 80, to: "fd00:ec2::254"}
+      outgoing_rules_not_listed: remove
+      enabled: true
+
+  # The first boot supplied wg0.private_key; MMX reuses the existing key. If
+  # the key file is absent, the node creates a key, which the setup then
+  # copies into inventories/servers.yml as wireguard_public_key.
+  - id: install_the_wireguard_tools
+    apt_package:
+      packages:
+        - {name: wireguard-tools, version: newest_when_first_installed}
+  - id: join_the_wireguard_network
+    wireguard_interface:
+      name: wg0
+      template: files/wireguard_wg0.conf
+      restore_unless_controller_confirms_within: 2m
+
+  # Journal size limits: a disk that fills with logs is the most common
+  # outage of a new system.
+  - task_block:
+      id: journal_size_limits
+      changes:
+        - id: create_the_journald_settings_directory
+          directory:
+            path: /etc/systemd/journald.conf.d
+            owner: root
+            group: root
+            permissions_mode: "0755"
+        - id: write_the_journal_size_limits
+          file:
+            path: /etc/systemd/journald.conf.d/50-monkeymaxxing-solo.conf
+            content: |
+              # Managed by MMX. The journal keeps at most 2 GB, and always
+              # leaves 4 GB of the disk free; the oldest entries go first.
+              [Journal]
+              SystemMaxUse=2G
+              SystemKeepFree=4G
+            owner: root
+            group: root
+            permissions_mode: "0644"
+      activate:
+        - id: restart_journald
+          systemd_service:
+            name: systemd-journald
+            state: running
+            refresh: restart
+
+  # Security updates, installed every day by the distribution's
+  # unattended-upgrades, and the updates from the vendors' repositories of
+  # Caddy and cloudflared. No update reboots the server by itself.
+  - id: install_unattended_upgrades
+    apt_package:
+      packages:
+        - {name: unattended-upgrades, version: newest_when_first_installed}
+        - {name: needrestart, version: newest_when_first_installed}
+  - id: refresh_package_lists_and_upgrade_every_day
+    file:
+      path: /etc/apt/apt.conf.d/20auto-upgrades
+      content: |
+        APT::Periodic::Update-Package-Lists "1";
+        APT::Periodic::Unattended-Upgrade "1";
+      owner: root
+      group: root
+      permissions_mode: "0644"
+  - id: write_the_unattended_upgrades_settings
+    file:
+      path: /etc/apt/apt.conf.d/52unattended-upgrades-local
+      source: files/unattended_upgrades.conf
+      owner: root
+      group: root
+      permissions_mode: "0644"
+  - id: create_the_needrestart_settings_directory
+    directory:
+      path: /etc/needrestart/conf.d
+      create_missing_parent_directories: true
+      owner: root
+      group: root
+      permissions_mode: "0755"
+  - id: write_when_needrestart_restarts_services
+    file:
+      path: /etc/needrestart/conf.d/50-monkeymaxxing-solo.conf
+      source: files/needrestart.conf
+      owner: root
+      group: root
+      permissions_mode: "0644"
+  # A new server's image can be months old, with a hundred security updates
+  # waiting. The first MMX run installs them at once, in one dpkg run.
+  # A new server runs apt by itself in its first minutes: cloud-init's first
+  # boot, then apt's daily timers. unattended-upgrade stops at once while
+  # another program holds apt's lock, so the script pauses apt's two timers,
+  # waits (at most 5 minutes each) for cloud-init and for an apt run already
+  # going to end, installs, and starts the timers again.
+  - id: install_the_waiting_security_updates_on_a_new_server
+    time_limit: 30m
+    shell:
+      script: |
+        systemctl stop apt-daily.timer apt-daily-upgrade.timer
+        trap 'systemctl start apt-daily.timer apt-daily-upgrade.timer' EXIT
+        if command -v cloud-init >/dev/null; then timeout 5m cloud-init status --wait >/dev/null 2>&1 || echo "cloud-init status --wait ended with exit $? (124: still running after 5 minutes); the install goes on"; fi
+        for _ in $(seq 60); do systemctl show --property ActiveState --value apt-daily.service apt-daily-upgrade.service | grep -qx -e active -e activating -e deactivating || break; sleep 5; done
+        apt-get update && unattended-upgrade --no-minimal-upgrade-steps
+      dryrun: printf 'would install the waiting security updates, the first time only\n'
+      run_only_once_marker_file: /var/lib/mmx/commands_run_once/security_updates_installed_on_a_new_server
+  - id: run_the_daily_package_list_refresh
+    systemd_service:
+      name: apt-daily.timer
+      state: running
+      start_at_boot: true
+  - id: run_the_daily_unattended_upgrade
+    systemd_service:
+      name: apt-daily-upgrade.timer
+      state: running
+      start_at_boot: true
+
+  # MMWatchdog checks when the distribution release stops receiving free
+  # security fixes, using the dates from the distro-info-data package.
+  - id: install_the_release_dates_of_the_distribution
+    apt_package:
+      packages:
+        - {name: distro-info-data, version: newest_when_first_installed}
+
+  # The app containers' security profile, loaded before the apps role runs.
+  # Debian's named crun profile is stacked with a no-new-privileges
+  # container. The profile allows signals to that full peer label while
+  # keeping the container's file, mount, and host-signal restrictions.
+  - task_block:
+      id: app_container_apparmor
+      changes:
+        - id: install_apparmor
+          apt_package:
+            packages:
+              - {name: apparmor, version: newest_when_first_installed}
+        - id: run_apparmor_at_boot
+          systemd_service:
+            name: apparmor
+            state: running
+            start_at_boot: true
+        - id: write_the_app_container_profile
+          file:
+            path: /etc/apparmor.d/solo-app-containers
+            source: files/solo-app-containers
+            owner: root
+            group: root
+            permissions_mode: "0644"
+            check_new_file:
+              shell:
+                script: apparmor_parser --skip-kernel-load --skip-read-cache "$NEW_FILE"
+                dryrun: apparmor_parser --skip-kernel-load --skip-read-cache "$NEW_FILE"
+                env:
+                  NEW_FILE: "{{ .new_file.path }}"
+        # The app containers run with UserNS=auto: Podman gives each one its
+        # own unused, unprivileged range of user ids, so root inside a
+        # container is not root on the server. Podman takes those ids from
+        # the "containers" user's range in /etc/subuid and /etc/subgid.
+        # Debian ships no such range, and without it a container fails to
+        # start with "Cannot find mappings for user containers". The range
+        # starts at 2147483647 and holds 2147483648 ids, far above the ids
+        # of the server's own users.
+        - id: give_app_containers_a_range_of_user_ids
+          line:
+            path: /etc/subuid
+            match: '^containers:'
+            line: "containers:2147483647:2147483648"
+            insert_at_end_of_file: true
+        - id: give_app_containers_a_range_of_group_ids
+          line:
+            path: /etc/subgid
+            match: '^containers:'
+            line: "containers:2147483647:2147483648"
+            insert_at_end_of_file: true
+      activate:
+        # Restarting AppArmor's boot service loads every profile in
+        # /etc/apparmor.d again, ours included. MMX restarts the service only
+        # when the profile file changed, so a dryrun of an unchanged server
+        # proposes nothing.
+        - id: load_the_app_container_profile
+          systemd_service:
+            name: apparmor
+            state: running
+            refresh: restart
+
+  # The MMWatchdog release is unpacked beside the earlier releases. Nothing
+  # runs the new release yet: the monitoring_and_outside_alarm role selects
+  # it and starts it.
+  - id: create_the_mmwatchdog_group
+    group:
+      name: mmwatchdog
+      system: true
+  # MMWatchdog runs its shell checks as the mmwatchdog user account.
+  - id: create_the_mmwatchdog_check_account
+    user:
+      name: mmwatchdog
+      system: true
+      primary_group: mmwatchdog
+      home: /var/lib/mmwatchdog-checks
+      create_home_directory: false
+  - id: create_the_home_of_the_mmwatchdog_check_account
+    directory:
+      path: /var/lib/mmwatchdog-checks
+      owner: mmwatchdog
+      group: mmwatchdog
+      permissions_mode: "0700"
+  - id: create_the_mmwatchdog_program_directory
+    directory:
+      path: /usr/local/lib/mmwatchdog
+      owner: root
+      group: root
+      permissions_mode: "0755"
+  - id: create_the_mmwatchdog_releases_directory
+    directory:
+      path: /usr/local/lib/mmwatchdog/releases
+      owner: root
+      group: root
+      permissions_mode: "0755"
+  # MMWatchdog's configuration, and the secret files of the alert destination
+  # (/etc/mmwatchdog/secrets), which the playbook's stage for the chosen kind
+  # writes before the monitoring_and_outside_alarm role validates the
+  # configuration. Only root reads them.
+  - id: create_the_mmwatchdog_configuration_directory
+    directory:
+      path: /etc/mmwatchdog
+      owner: root
+      group: root
+      permissions_mode: "0755"
+  - id: create_the_mmwatchdog_secrets_directory
+    directory:
+      path: /etc/mmwatchdog/secrets
+      owner: root
+      group: root
+      permissions_mode: "0700"
+  # MMWatchdog's modules of the project's own. Solo has none, and MMWatchdog
+  # needs /usr/local/lib/mmwatchdog/external_modules anyway.
+  - id: create_the_mmwatchdog_external_modules_directory
+    directory:
+      path: /usr/local/lib/mmwatchdog/external_modules
+      owner: root
+      group: root
+      permissions_mode: "0755"
+  - id: unpack_the_mmwatchdog_release
+    unpack_archive:
+      url: "{{ .inputs.mmwatchdog_release.download_url }}"
+      sha256: "{{ .inputs.mmwatchdog_release.sha256 }}"
+      path: "/usr/local/lib/mmwatchdog/releases/{{ .inputs.mmwatchdog_release.version }}"
+      unpack_without_wrapping_folder: true

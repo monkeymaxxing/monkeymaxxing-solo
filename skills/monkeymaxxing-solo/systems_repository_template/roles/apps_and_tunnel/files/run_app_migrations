@@ -1,0 +1,30 @@
+#!/bin/bash
+# Runs one app's migration command in a one-off container of the given image,
+# with the app's settings and secrets, on this server's network.
+#
+# Usage: run_app_migrations APP_NAME IMAGE MIGRATION_COMMAND...
+#
+# Each statement of the migration waits at most 5 seconds for a table lock
+# and then fails, so a deploy stops before its switch instead of holding up
+# live requests behind the lock. PGOPTIONS is read by every driver built on
+# libpq (Ruby's pg, Python's psycopg, PHP's), by Go's pgx, and by Node's pg.
+# Prisma apps put `?options=-c%20lock_timeout%3D5s` in their migration URL; an
+# app with another driver sets lock_timeout in its own database settings.
+#
+# Solo has no PgBouncer, so the app's database file already connects directly
+# to Postgres on solo01's WireGuard address. Podman reads the env files in
+# order, and a later file's setting wins, so the database file comes last.
+set -euo pipefail
+
+app_name="$1"
+image="$2"
+shift 2
+
+exec podman run --rm --name "$app_name-migrations" --network host \
+  --userns=auto \
+  --security-opt apparmor=solo-app-containers \
+  --env-file "/etc/$app_name/${app_name}_settings.env" \
+  --env-file "/etc/$app_name/$app_name.env" \
+  --env-file "/etc/$app_name/${app_name}_database.env" \
+  --env PGOPTIONS="-c lock_timeout=5s" \
+  "$image" "$@"

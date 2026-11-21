@@ -1,0 +1,20 @@
+{{- /*
+  The redirect from UDP 443, where the outside world reaches WireGuard, to
+  the port WireGuard listens on, inventory vars.wireguard_listen_port. The
+  base_server role renders it as a template.
+
+  Why nftables and not ufw's before.rules: this is a table of its own, so it
+  touches none of ufw's files, and MMX's ufw module keeps owning ufw.
+  Why a redirect at all: WireGuard cannot bind 443 where AppArmor confines
+  wg-quick (inventories/servers.yml, wireguard_listen_port).
+*/ -}}
+#!/usr/sbin/nft -f
+# Replace only our table, so loading this file again is safe.
+table inet solo_wireguard_port {}
+flush table inet solo_wireguard_port
+table inet solo_wireguard_port {
+    chain prerouting {
+        type nat hook prerouting priority dstnat; policy accept;
+        udp dport 443 redirect to :{{ .inputs.wireguard_listen_port }}
+    }
+}

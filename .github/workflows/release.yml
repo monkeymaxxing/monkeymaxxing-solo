@@ -1,0 +1,55 @@
+name: Publish release archives
+
+# Pushing a version tag, such as v0.1.0, builds reproducible release archives
+# of set-up-solo-services for macOS and Linux (amd64 and arm64) using
+# set_up_solo_services/build_release_archives.sh, writes SHA256SUMS, attests
+# build provenance, and attaches them to the GitHub release of that tag.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions: {}
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6.1.0
+        env:
+          GOTOOLCHAIN: auto
+        with:
+          go-version-file: set_up_solo_services/go.mod
+          cache: false
+      - name: Confirm the tag is a version, such as v0.1.0
+        id: version
+        shell: bash
+        run: |
+          if ! [[ "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "The tag $GITHUB_REF_NAME is not a Solo version such as v0.1.0." >&2; exit 1
+          fi
+          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Build release archives and SHA256SUMS
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          set_up_solo_services/build_release_archives.sh "$RELEASE_VERSION" "$RUNNER_TEMP/release"
+      - name: Attest the release archives
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-path: ${{ runner.temp }}/release/*.tar.gz
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release create "$GITHUB_REF_NAME" "$RUNNER_TEMP/release/"*.tar.gz "$RUNNER_TEMP/release/SHA256SUMS" \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --title "Monkeymaxxing Solo $GITHUB_REF_NAME" --generate-notes

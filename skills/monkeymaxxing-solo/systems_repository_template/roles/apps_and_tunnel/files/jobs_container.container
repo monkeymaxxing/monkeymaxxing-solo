@@ -1,0 +1,49 @@
+{{- /*
+  An app's job container, as a Quadlet file: it runs the app's jobs_command.
+  It reads the loop variable job_container (key: the app's name; value: the
+  image of the release it runs) and the role input apps. An app whose
+  jobs_command is "" has no background jobs and no job container: the role
+  never renders this file for it.
+*/ -}}
+{{- $app_name := .job_container.key -}}
+{{- $app := index .inputs.apps $app_name -}}
+{{- if eq $app.jobs_command "" }}{{ fail (printf "apps.%s has jobs_command \"\" (no background jobs), so it has no job container: the role that renders this file skips the app. This message means the role did not skip it." $app_name) }}{{ end -}}
+# Managed by MMX from roles/apps_and_tunnel/files/jobs_container.container in the systems repository.
+[Unit]
+Description={{ $app_name }} job container
+
+[Container]
+ContainerName={{ $app_name }}-jobs
+Image={{ .job_container.value.image }}
+# The server's own network, as the web containers have.
+Network=host
+EnvironmentFile=/etc/{{ $app_name }}/{{ $app_name }}_settings.env
+EnvironmentFile=/etc/{{ $app_name }}/{{ $app_name }}.env
+EnvironmentFile=/etc/{{ $app_name }}/{{ $app_name }}_database.env
+Exec={{ $app.jobs_command }}
+LogDriver=journald
+# The container's file system is read-only, as the web containers' is:
+# see roles/apps_and_tunnel/files/web_container.container.
+ReadOnly=true
+ReadOnlyTmpfs=true
+{{- if hasKey $app "writable_temporary_directories" }}
+{{- range $app.writable_temporary_directories }}
+Tmpfs={{ . }}:mode=1777
+{{- end }}
+{{- end }}
+# Root inside the container is not root on the server (UserNS=auto), and the
+# app has no Linux capability and no way to gain privileges, as the web
+# containers' comments in web_container.container say.
+UserNS=auto
+DropCapability=all
+NoNewPrivileges=true
+PodmanArgs=--security-opt=apparmor=solo-app-containers
+# The stop signal, then up to 30 seconds for a worker to finish its current
+# job; a job queue in Postgres runs a job again whose worker did not finish.
+StopTimeout=30
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

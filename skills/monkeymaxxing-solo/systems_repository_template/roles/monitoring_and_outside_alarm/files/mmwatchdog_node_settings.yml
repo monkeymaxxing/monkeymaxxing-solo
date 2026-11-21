@@ -1,0 +1,9 @@
+# Managed by MMX from roles/monitoring_and_outside_alarm/files/mmwatchdog_node_settings.yml
+# in the systems repository. MMWatchdog on solo01 runs standalone: it reports
+# to no fleet hub and delivers its own alerts (alert_destinations.yml).
+keep_undelivered_alerts_for: 24h                 # keep an alert that could not be delivered, and try again, for 24 hours
+undelivered_alerts_content_size_limit: 8MiB      # and keep at most 8 MiB of such alerts
+alert_severity_when_this_node_goes_silent: sos   # only a fleet hub reads it: solo01 has no hub, the outside alarm watches for silence instead
+alert_severity_when_this_node_has_rebooted: warn # the severity of the notice after a reboot of solo01
+keep_measurement_history_for: 7d                 # keep every reading of the checks for 7 days
+measurement_history_size_limit: 256MiB           # and never more than 256 MiB of readings

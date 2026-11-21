@@ -1,0 +1,19 @@
+{{- /*
+  The settings of run_local_restore_check, /etc/solo/restore_check_settings.json.
+  It reads the role inputs apps and postgresql_major_version. Each app's
+  restore_drill_check_queries come from vars.apps in mmx_project_settings.yml.
+*/ -}}
+{{- $apps := dict -}}
+{{- range $app_name, $app := .inputs.apps -}}
+{{- $_ := set $apps $app_name (dict "database_name" $app.database_name "queries" $app.restore_drill_check_queries) -}}
+{{- end -}}
+{{- $settings := dict
+  "postgresql_major_version" .inputs.postgresql_major_version
+  "pgbackrest_config_file" "/etc/pgbackrest/pgbackrest.conf"
+  "stanza" "main"
+  "scratch_directory" "/var/lib/solo-restore-check/scratch"
+  "result_file" "/var/lib/solo-restore-check/last-result.json"
+  "seconds_to_wait_for_postgres" 300
+  "seconds_to_wait_for_the_restore" 7200
+  "apps" $apps -}}
+{{ toPrettyJson $settings }}

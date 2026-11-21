@@ -1,0 +1,171 @@
+{{- /*
+  MMWatchdog's check groups for solo01 itself. This file is an MMX template:
+  MMX renders it on solo01 into /etc/mmwatchdog/check_groups/every_server.yml.
+  It reads the server's own facts.
+*/ -}}
+{{- $raid_arrays := list -}}
+{{- range .node.storage.block_devices -}}{{- if eq .kind "raid_array" -}}{{- $raid_arrays = append $raid_arrays . -}}{{- end -}}{{- end -}}
+# Managed by MMX from mmwatchdog_checks/every_server.yml in the systems repository.
+# To be woken for a check, set that check's alert_severity to sos. warn tells
+# you during the day; sos wakes you, and Pushover repeats it until you
+# acknowledge it. The checks a careful team raises first: the backups,
+# write-ahead log archiving, and the weekly local restore check. Each value
+# below has its reason beside it; change a value only with a reason of your
+# own.
+check_groups:
+  systemd_units:
+    check_every: 1m
+    time_limit_per_run: 30s
+    alert_after_failing_for: 2m
+    recovered_after_healthy_for: 1m
+    checks:
+      # Every service, the app's containers and the backup timers' jobs
+      # included: each runs as a systemd unit.
+      # Reason for warn: a failed unit is one service down, and the outside
+      # alarm's check of your public health URL wakes you when users are
+      # hurt. 2 minutes ignores a restart in progress.
+      no_systemd_unit_has_failed:
+        every_systemd_unit:
+          fail_when: a_systemd_unit_has_failed
+          systemd_units_to_ignore: []
+        alert_severity: warn
+
+  disks:
+    check_every: 1m
+    time_limit_per_run: 30s
+    alert_after_failing_for: 5m
+    recovered_after_healthy_for: 5m
+    checks:
+      # Reason for 85%: it leaves days, normally, to free space or choose a
+      # bigger server before the 95% check. Reason for warn: nothing has
+      # stopped yet.
+      every_filesystem_is_below_85_percent_full:
+        every_disk_and_network_filesystem:
+          filesystems_to_ignore: []
+        fail_when_measurement_above:
+          space_used_percent: 85
+          inodes_used_percent: 85
+        alert_severity: warn
+      # A full disk stops Postgres and the apps. The weekly local restore
+      # check also needs free space as large as the database.
+      # Reason for sos: services stop soon.
+      every_filesystem_is_below_95_percent_full:
+        every_disk_and_network_filesystem:
+          filesystems_to_ignore: []
+        fail_when_measurement_above:
+          space_used_percent: 95
+          inodes_used_percent: 95
+        alert_severity: sos
+{{- if $raid_arrays }}
+
+  # A dedicated server mirrors its drives with Linux software RAID. A mirror
+  # that lost a drive keeps the server running; replace the server.
+  software_raid:
+    check_every: 1m
+    time_limit_per_run: 10s
+    alert_after_failing_for: 1m
+    recovered_after_healthy_for: 1m
+    checks:
+{{- range $raid_arrays }}
+      {{ .name }}_has_every_drive:
+        mdadm_array: {{ .path }}
+        alert_severity: warn
+{{- end }}
+{{- end }}
+
+  # Reason for 80%: leaves room for a deploy, which runs the new and the live
+  # release together beside Postgres. Reason for warn: slow or killed
+  # processes, not yet an outage.
+  memory:
+    check_every: 5m
+    time_limit_per_run: 10s
+    alert_after_failing_for: 15m
+    recovered_after_healthy_for: 5m
+    checks:
+      memory_is_below_80_percent:
+        node_resource: memory
+        fail_when_measurement_above:
+          memory_used_percent: 80
+        alert_severity: warn
+
+  security_updates:
+    check_every: 1h
+    time_limit_per_run: 1m
+    # unattended-upgrades installs security updates within a day.
+    alert_after_failing_for: 26h
+    recovered_after_healthy_for: 0s
+    checks:
+      # Reason for warn: a waiting update is a risk, not an outage. The delay
+      # (set above) is longer than unattended-upgrades needs to install, so
+      # a longer wait means the install is stuck.
+      no_security_update_waits:
+        apt_security_updates:
+          fail_when: a_security_update_waits_to_be_installed
+        alert_severity: warn
+      # No server reboots by itself. During your weekly maintenance window
+      # (maintenance_window in mmx_project_settings.yml), you run
+      # playbooks/reboot_after_updates.yml, which reboots solo01 when an
+      # update asks for it. On Debian, unattended-upgrades' kernel hook
+      # writes /var/run/reboot-required for a new kernel. A reboot can
+      # therefore wait a week. no_reboot_waits warns after 8 days of needing
+      # a reboot: one week plus a day of slack.
+      no_reboot_waits:
+        reboot_after_updates:
+          fail_when: the_node_must_reboot_to_use_installed_updates
+        alert_severity: warn
+        alert_after_failing_for: 8d
+      # Solo supports a Debian release only while Debian's security team gives
+      # the release regular security support, which ends about one year after
+      # the next Debian release. The warning comes 180 days before that
+      # support ends: then rebuild solo01 on the next Debian release.
+      security_support_lasts_another_half_year:
+        distribution_release_security_support:
+          security_support: regular
+          fail_when_security_support_ends_within: 180d
+        alert_severity: warn
+
+  installed_packages:
+    # MMWatchdog checks installed packages by downloading CISA's list of
+    # known exploited vulnerabilities from raw.githubusercontent.com and
+    # asking api.osv.dev about the server's packages. Checking installed
+    # packages takes about 100 s, so installed_packages runs every 6 hours.
+    # The second failed run opens the incident.
+    check_every: 6h
+    time_limit_per_run: 5m
+    alert_after_failing_for: 5h
+    recovered_after_healthy_for: 0s
+    checks:
+      # known_exploited_flaws warns because the check cannot tell which flaws
+      # reach solo01. Read the alert's package and decide: a flaw in OpenSSH
+      # or in the running kernel that a waiting reboot fixes deserves a fix
+      # the same day.
+      known_exploited_flaws:
+        known_exploited_vulnerabilities_in_installed_packages:
+          fail_when: an_installed_package_is_affected
+        alert_severity: warn
+
+  # Reason for warn and 10 minutes: a clock that drifts breaks logs and TLS,
+  # but only after a long drift; 10 minutes ignores the resync after a restart.
+  clock:
+    check_every: 1m
+    time_limit_per_run: 10s
+    alert_after_failing_for: 10m
+    recovered_after_healthy_for: 1m
+    checks:
+      the_clock_is_synchronized:
+        node_clock:
+          fail_when: the_clock_is_not_synchronized
+        alert_severity: warn
+
+  # Reason for warn: the kernel killed a process and the server runs on, so
+  # the server needs more memory, not an urgent repair.
+  out_of_memory_kills:
+    check_every: 1m
+    time_limit_per_run: 10s
+    alert_after_failing_for: 0s
+    recovered_after_healthy_for: 10m
+    checks:
+      no_process_was_killed_for_lack_of_memory:
+        out_of_memory_kills:
+          fail_when: the_kernel_kills_a_process_for_lack_of_memory
+        alert_severity: warn
