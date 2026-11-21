@@ -161,6 +161,11 @@ type each secret at a hidden prompt in your own terminal.
 - [docs/testing.md](docs/testing.md): the test levels.
 - [CONTRIBUTING.md](CONTRIBUTING.md): bug reports, ideas, and pull
   requests.
+- [Monkeymaxxing Recipes](https://github.com/monkeymaxxing/monkeymaxxing-recipes):
+  the shared cookbook for Solo and the Stack. It holds the
+  [app framework guides](https://github.com/monkeymaxxing/monkeymaxxing-recipes/tree/main/frameworks),
+  the [platform migration guides](https://github.com/monkeymaxxing/monkeymaxxing-recipes/tree/main/migrations),
+  and add-on recipes for extra services and MMWatchdog check packs.
 
 ## Running the tests
 

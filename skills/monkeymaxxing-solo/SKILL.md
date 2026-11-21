@@ -219,14 +219,14 @@ Introduce each idea when its first action comes, not all at once.
 
 ## Guides for your app
 
-The Monkeymaxxing Stack's guides apply to Solo unchanged, because both use
-the same app contract. Read the one for the app's framework or its current
-host when you get an app ready, or add one:
+The guides in Monkeymaxxing Recipes apply to Solo unchanged, because Solo and
+the Monkeymaxxing Stack use the same app contract. Read the one for the app's
+framework or its current host when you get an app ready, or add one:
 
-- [Framework guides](https://github.com/monkeymaxxing/monkeymaxxing-stack/blob/main/docs/app-frameworks/README.md):
+- [Framework guides](https://github.com/monkeymaxxing/monkeymaxxing-recipes/tree/main/frameworks):
   Rails, Django, FastAPI, Laravel, Express, Next.js, Nuxt, SvelteKit,
   TanStack Start, Go, and Rust apps on Postgres.
-- [Platform migration guides](https://github.com/monkeymaxxing/monkeymaxxing-stack/blob/main/docs/app-platform-migrations/README.md):
+- [Platform migration guides](https://github.com/monkeymaxxing/monkeymaxxing-recipes/tree/main/migrations):
   moving from Heroku, Render, Railway, Fly, Vercel, Netlify, Supabase,
   Firebase, Docker Compose, Kamal, Dokku, Coolify, Kubernetes, ECS, and
   others.
