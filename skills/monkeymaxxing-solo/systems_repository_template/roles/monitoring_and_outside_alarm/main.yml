@@ -36,6 +36,12 @@ inputs:
   public_site_checks_run:                   # vars.public_site_checks_run
     type: boolean
     required: true
+  mmwatchdog_check_files:                   # vars.mmwatchdog_check_files: the files of mmwatchdog_checks/ to install
+    type: list
+    required: true
+  custom:                                   # vars.custom: the settings of the person's own extensions
+    type: mapping
+    required: true
   outside_alarm_check_in_token:             # the Worker's check-in token
     type: string
     required: true
@@ -73,24 +79,21 @@ node_tasks:
             owner: root
             group: root
             permissions_mode: "0644"
-        - id: write_the_candidate_check_groups_of_the_server
-          file:
-            path: /usr/local/lib/mmwatchdog/candidate_config/check_groups/every_server.yml
-            template: ../../mmwatchdog_checks/every_server.yml
+        # The candidate holds exactly the files of mmwatchdog_check_files, so a
+        # file removed from the list cannot stay behind and fail validation.
+        - id: delete_every_other_candidate_check_group
+          directory:
+            path: /usr/local/lib/mmwatchdog/candidate_config/check_groups
             owner: root
             group: root
-            permissions_mode: "0644"
-        - id: write_the_candidate_check_groups_of_postgres_and_backups
+            permissions_mode: "0700"
+            delete_everything_inside_except: "{{ .inputs.mmwatchdog_check_files }}"
+        - id: write_the_candidate_check_groups
+          loop: "{{ .inputs.mmwatchdog_check_files }}"
+          as: check_file
           file:
-            path: /usr/local/lib/mmwatchdog/candidate_config/check_groups/postgres_and_backups.yml
-            template: ../../mmwatchdog_checks/postgres_and_backups.yml
-            owner: root
-            group: root
-            permissions_mode: "0644"
-        - id: write_the_candidate_check_groups_of_the_apps_and_the_tunnel
-          file:
-            path: /usr/local/lib/mmwatchdog/candidate_config/check_groups/apps_and_tunnel.yml
-            template: ../../mmwatchdog_checks/apps_and_tunnel.yml
+            path: "/usr/local/lib/mmwatchdog/candidate_config/check_groups/{{ .check_file }}"
+            template: "../../mmwatchdog_checks/{{ .check_file }}"
             owner: root
             group: root
             permissions_mode: "0644"
@@ -128,32 +131,21 @@ node_tasks:
             owner: root
             group: root
             permissions_mode: "0644"
-        # The check groups directory holds exactly the three files below.
+        # The check groups directory holds exactly the files of
+        # mmwatchdog_check_files.
         - id: delete_every_other_check_group
           directory:
             path: /etc/mmwatchdog/check_groups
             owner: root
             group: root
             permissions_mode: "0755"
-            delete_everything_inside_except: [every_server.yml, postgres_and_backups.yml, apps_and_tunnel.yml]
-        - id: install_the_check_groups_of_the_server
+            delete_everything_inside_except: "{{ .inputs.mmwatchdog_check_files }}"
+        - id: install_the_check_groups
+          loop: "{{ .inputs.mmwatchdog_check_files }}"
+          as: check_file
           file:
-            path: /etc/mmwatchdog/check_groups/every_server.yml
-            content_from_node_paths: [/usr/local/lib/mmwatchdog/candidate_config/check_groups/every_server.yml]
-            owner: root
-            group: root
-            permissions_mode: "0644"
-        - id: install_the_check_groups_of_postgres_and_backups
-          file:
-            path: /etc/mmwatchdog/check_groups/postgres_and_backups.yml
-            content_from_node_paths: [/usr/local/lib/mmwatchdog/candidate_config/check_groups/postgres_and_backups.yml]
-            owner: root
-            group: root
-            permissions_mode: "0644"
-        - id: install_the_check_groups_of_the_apps_and_the_tunnel
-          file:
-            path: /etc/mmwatchdog/check_groups/apps_and_tunnel.yml
-            content_from_node_paths: [/usr/local/lib/mmwatchdog/candidate_config/check_groups/apps_and_tunnel.yml]
+            path: "/etc/mmwatchdog/check_groups/{{ .check_file }}"
+            content_from_node_paths: ["/usr/local/lib/mmwatchdog/candidate_config/check_groups/{{ .check_file }}"]
             owner: root
             group: root
             permissions_mode: "0644"

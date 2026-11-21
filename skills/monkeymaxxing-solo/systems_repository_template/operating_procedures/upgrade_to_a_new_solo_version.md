@@ -30,6 +30,24 @@ notes name as a person's step.
    person's own values: every line the setup filled, each app, the
    schedules, and the alert settings.
 
+   Also keep everything the person added from a recipe. The template never
+   holds these, so a diff never asks you to remove them:
+
+   - the `custom_recipes/` directory;
+   - `custom_extensions:` in `monkeymaxxing_solo_checklist.yml`;
+   - the files `mmwatchdog_checks/custom_*.yml`, and their names in
+     `mmwatchdog_check_files` in `mmx_project_settings.yml` (carry a new
+     core name into that list, and keep every `custom_*.yml` name);
+   - `custom:` in `mmx_project_settings.yml`;
+   - every custom fleet stage and role call between the
+     `# --- Custom extensions (start) ---` and `# --- Custom extensions (end) ---`
+     lines of `playbooks/solo_server.yml`, and any role of the recipe in
+     `roles/`.
+
+   When a template change touches lines beside one of these markers, carry
+   it by hand and keep the marker lines and the lines between them exactly
+   as they are.
+
 4. **Install new pinned programs on the laptop.** When `solo_software`
    changed, install the new `mmx` and `doubleshell` releases as the
    initial setup's step 4 does.

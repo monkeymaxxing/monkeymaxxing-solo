@@ -19,6 +19,7 @@ repository is for, so a run that cannot use it proves nothing.
 import json
 import os
 import pathlib
+import re
 import subprocess
 import tempfile
 import unittest
@@ -137,6 +138,71 @@ class TemplateValidatesWithMmx(unittest.TestCase):
             if entry.get("only_read_by_fleet_stages_left_out_before_the_run"):
                 continue
             self.assertIsNotNone(entry["source"], entry["key"] + " is read by a playbook but is not in the test vault")
+
+    CHECK_FILES_LINE = "mmwatchdog_check_files: [every_server.yml, postgres_and_backups.yml, apps_and_tunnel.yml]"
+
+    def project_with_check_files(self, name, check_files):
+        return self.filled_copy(name, [(self.CHECK_FILES_LINE, "mmwatchdog_check_files: [" + ", ".join(check_files) + "]")])
+
+    def test_a_custom_check_pack_is_validated_explained_cleaned_rendered_and_installed(self):
+        project = self.project_with_check_files(
+            "custom_check_pack", ["every_server.yml", "postgres_and_backups.yml", "apps_and_tunnel.yml", "custom_example.yml"]
+        )
+        settings_file = project / "mmx_project_settings.yml"
+        settings_file.write_text(
+            template_filler.replace_once(settings_file.read_text(encoding="utf-8"), "custom: {}", "custom: {example_threshold: 80}"),
+            encoding="utf-8",
+        )
+        (project / "mmwatchdog_checks" / "custom_example.yml").write_text(
+            "check_groups:\n"
+            "  custom_example:\n"
+            "    check_every: 5m\n"
+            "    time_limit_per_run: 30s\n"
+            "    alert_after_failing_for: 5m\n"
+            "    recovered_after_healthy_for: 5m\n"
+            "    checks:\n"
+            "      every_filesystem_stays_below_custom_limit:\n"
+            "        every_disk_and_network_filesystem:\n"
+            "          filesystems_to_ignore: []\n"
+            "        fail_when_measurement_above:\n"
+            "          space_used_percent: {{ .inputs.custom.example_threshold }}\n"
+            "        alert_severity: warn\n",
+            encoding="utf-8",
+        )
+        finished = self.run_mmx(project, "validate", "solo_server")
+        self.assertEqual(finished.returncode, 0, finished.stdout + finished.stderr)
+        self.assertIn("Valid", finished.stdout)
+        explained = self.run_mmx(project, "explain", "solo_server")
+        self.assertEqual(explained.returncode, 0, explained.stdout + explained.stderr)
+        text = explained.stdout
+        self.assertIn('inputs.custom = {"example_threshold":80}', text)
+        # Both stale-file cleanups (the candidate directory and the live directory) keep the custom file.
+        kept = '["every_server.yml","postgres_and_backups.yml","apps_and_tunnel.yml","custom_example.yml"]'
+        self.assertEqual(text.count("directory.delete_everything_inside_except = " + kept), 2, "the candidate and the live check_groups directories must both keep custom_example.yml")
+        # The custom file is rendered into the candidate directory and installed from it.
+        self.assertIn('file.path = "/usr/local/lib/mmwatchdog/candidate_config/check_groups/custom_example.yml"', text)
+        self.assertIn('file.template = "../../mmwatchdog_checks/custom_example.yml"', text)
+        self.assertIn('file.content_from_node_paths[0] = "/usr/local/lib/mmwatchdog/candidate_config/check_groups/custom_example.yml"', text)
+        self.assertIn('file.path = "/etc/mmwatchdog/check_groups/custom_example.yml"', text)
+
+    def test_a_check_file_name_that_climbs_out_of_the_directory_is_refused(self):
+        project = self.project_with_check_files("check_file_with_dots", ["every_server.yml", "../bad.yml"])
+        finished = self.run_mmx(project, "validate", "solo_server")
+        self.assertNotEqual(finished.returncode, 0, "a check file name with a .. part must not validate")
+        self.assertIn(".. part", finished.stdout + finished.stderr)
+
+    def test_the_playbook_accepts_only_plain_yml_check_file_names(self):
+        playbook = (template_filler.TEMPLATE_DIRECTORY / "playbooks" / "solo_server.yml").read_text(encoding="utf-8")
+        pattern = re.search(r"matches: \[\"\{\{ \.check_file \}\}\", '([^']+)'\]", playbook)
+        self.assertIsNotNone(pattern, "solo_server.yml has no check file name rule")
+        # MMX's matches is an RE2 search; Go and Python agree on this simple pattern.
+        rule = re.compile(pattern.group(1))
+        for name in ("every_server.yml", "custom_redis.yml", "custom-a_1.yml"):
+            with self.subTest(accepted=name):
+                self.assertTrue(rule.search(name), name)
+        for name in ("../bad.yml", "sub/bad.yml", "/etc/bad.yml", "Bad.yml", ".hidden.yml", "bad.yaml", "_bad.yml", ""):
+            with self.subTest(refused=name):
+                self.assertFalse(rule.search(name), repr(name))
 
 
 if __name__ == "__main__":

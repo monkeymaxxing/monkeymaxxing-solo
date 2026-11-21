@@ -12,6 +12,13 @@
 # fails, such as an app whose new image does not start, leaves MMWatchdog
 # already running: the monitoring stage comes before the apps stage.
 #
+# Custom stages from recipes go in the "Custom extensions" block, after
+# postgres_and_backups and before monitoring_and_outside_alarm. Reason: a
+# custom service, such as Redis, then runs before MMWatchdog starts its
+# custom_*.yml checks, so the first install raises no false alert, and
+# before any app that uses it starts. A stage in the block uses
+# nodes: solo_server and on_node_failure: stop_run, as its neighbors do.
+#
 # The very first run happens over the WireGuard network that the setup's
 # first-boot step started on solo01, with the server's own WireGuard key and
 # your laptop as the only peer (SKILL.md of Monkeymaxxing Solo). Until then
@@ -231,6 +238,31 @@ fleet_stages:
             "{{ .vars.outside_alarm.health_check_failures_before_alert }}". Use a whole
             number from 1 to 10, such as 2. Nothing changed.
 
+  # The MMWatchdog check files of mmwatchdog_check_files, checked before any
+  # server changes. Reason: the role writes each name into a path on solo01,
+  # so a name with a folder part, such as ../bad.yml, must never reach it.
+  - id: validate_the_mmwatchdog_check_files
+    nodes: solo_server
+    on_node_failure: stop_run
+    node_tasks:
+      - id: mmwatchdog_check_files_is_not_empty
+        assert:
+          that: {not: {equals: ["{{ .vars.mmwatchdog_check_files }}", []]}}
+          message: >-
+            mmwatchdog_check_files in mmx_project_settings.yml is empty. Name at
+            least every_server.yml, so MMWatchdog watches solo01. Nothing changed.
+      - id: each_mmwatchdog_check_file_is_a_plain_yml_file_name
+        loop: "{{ .vars.mmwatchdog_check_files }}"
+        as: check_file
+        assert:
+          that:
+            matches: ["{{ .check_file }}", '^[a-z0-9][a-z0-9_-]*\.yml$']
+          message: >-
+            mmwatchdog_check_files in mmx_project_settings.yml holds
+            "{{ .check_file }}". Write a file name from mmwatchdog_checks/ of
+            lowercase letters, digits, underscores and hyphens that ends in .yml,
+            with no folder part, such as custom_redis.yml. Nothing changed.
+
   # Programs the scripts below use, installed before the first script runs.
   - id: install_jq_curl_and_python3
     nodes: solo_server
@@ -440,6 +472,15 @@ fleet_stages:
           database_passwords:
             shop: "{{ .secrets.shop_database_password }}"
 
+  # --- Custom extensions (start) ---
+  # Add custom fleet stages from recipes inside this block, such as a Redis
+  # container or another sidecar service that your apps use.
+  # Keep these three boundary comment lines intact for clean upgrades.
+
+  # Keep these three boundary comment lines intact for clean upgrades.
+  # End of custom fleet stages.
+  # --- Custom extensions (end) ---
+
   # MMWatchdog and the outside alarm's check-in, before the apps, so a role
   # that fails below leaves MMWatchdog watching the server.
   - id: monitoring_and_outside_alarm
@@ -454,6 +495,8 @@ fleet_stages:
           alert_destination: "{{ .vars.alert_destination }}"
           outside_alarm: "{{ .vars.outside_alarm }}"
           public_site_checks_run: "{{ .vars.public_site_checks_run }}"
+          mmwatchdog_check_files: "{{ .vars.mmwatchdog_check_files }}"
+          custom: "{{ .vars.custom }}"
           outside_alarm_check_in_token: "{{ .secrets.outside_alarm_check_in_token }}"
 
   # Which port each app's live web container uses, and the free port for a new

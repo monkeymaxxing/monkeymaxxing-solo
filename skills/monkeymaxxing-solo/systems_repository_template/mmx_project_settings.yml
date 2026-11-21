@@ -62,6 +62,16 @@ vars:
   public_site_checks_run: false
   cloudflare_account_id:                     # the setup fills it: the 32-character Cloudflare account ID
 
+  # The MMWatchdog check files that solo01 runs, from mmwatchdog_checks/. Each
+  # file is one check group, and the role monitoring_and_outside_alarm installs
+  # exactly these files and removes any other check group from solo01. A
+  # check pack that a recipe adds is a file named custom_*.yml, such as
+  # custom_redis.yml: add its name to this list. Reason for the custom_
+  # prefix: a check file that a later Solo version adds never collides with
+  # your own file. Each name is lowercase letters, digits, underscores and
+  # hyphens, ends in .yml, and has no folder part.
+  mmwatchdog_check_files: [every_server.yml, postgres_and_backups.yml, apps_and_tunnel.yml]
+
   # The apps solo01 runs. Each app follows the same contract as the
   # Monkeymaxxing Stack, so moving to the Stack needs no app change: a
   # Containerfile, Postgres, Cloudflare R2 for uploaded files, a health URL,
@@ -238,3 +248,12 @@ vars:
     email_from: ""
     email_to: []
     email_login_user: ""
+
+  # Keep these three boundary comment lines intact for clean upgrades.
+  # Settings that a recipe adds for your own extensions go inside custom,
+  # such as custom: {redis_max_memory_megabytes: 256}. Solo reads none of them.
+  # A Solo upgrade never changes the lines between these markers.
+  custom: {}
+  # Keep these three boundary comment lines intact for clean upgrades.
+  # End of custom settings.
+  # Nothing below this line belongs to your own extensions.

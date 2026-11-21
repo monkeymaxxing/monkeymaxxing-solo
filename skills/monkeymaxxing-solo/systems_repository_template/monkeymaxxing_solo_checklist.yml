@@ -333,6 +333,21 @@ items:
       --replace`), `mmx run solo_server` changed only the files that hold it, and
       the old value is refused by the service that issued it.
 
+# The extensions that the person added from a recipe, such as a Redis sidecar
+# container or a custom MMWatchdog check pack. Each one is an additive item on
+# top of Solo's design, so it is no deviation from a core item above. The
+# coding agent adds one entry after the recipe's verification passed:
+#   id:              a short name, the same as custom_recipes/<id>.md
+#   title:           what it adds, in the person's words
+#   recipe:          the recipe's path in monkeymaxxing-recipes, such as services/redis.md
+#   source_url:      the address the recipe was read from
+#   source_commit:   the full commit of monkeymaxxing-recipes that was read
+#   applied_on:      the date (UTC) the extension went live
+#   state:           done | open
+#   verification:    what proved it works, and when
+# An empty list means no extension is installed.
+custom_extensions: []
+
 # What Solo leaves out. Informational: none of these is an open item, and
 # none is a gap in the setup. Each one is a reason to move to the Monkeymaxxing
 # Stack, which keeps the same app contract, so no app changes.
